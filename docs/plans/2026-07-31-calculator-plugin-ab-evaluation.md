@@ -53,10 +53,12 @@ Pin and record for both arms:
 - network policy and available commands;
 - independent evaluator version and rubric.
 
-Use clean Proxmox clones from the same credential-free snapshot. Install
-identical credentials separately. Run the pair in a randomized order, close
-enough in time to limit model-service drift, and do not tune prompts or plugin
-contents after the first arm starts.
+Use two fresh Proxmox LXCs from the same Ubuntu 24.04 template and byte-matched
+provisioning contract. This avoids duplicating source-container credentials,
+worker IDs, caches, and SSH host keys. Install equivalent credentials
+separately. Run the pair in a randomized order, close enough in time to limit
+model-service drift, and do not tune prompts or plugin contents after the first
+arm starts.
 
 ## Treatment boundary
 
@@ -144,7 +146,8 @@ plugin rather than moving the threshold after observing results.
 1. Implement and test the bundled prompt-plugin loader in the Factory fork.
 2. Build the `dotnet-quality` bundle at pinned third-party revisions.
 3. Create the immutable calculator seed and evaluator-owned hidden harness.
-4. Prepare two clean, equivalent Factory deployments.
+4. Prepare two clean, equivalent Factory deployments from the same LXC template
+   and provisioning inputs.
 5. Validate an empty control plugin set and one treatment plugin set in worker
    health, prompt snapshots, logs, and manifests.
 6. Randomize run order, record the assignment privately, and run both arms.
@@ -159,3 +162,16 @@ plugin rather than moving the threshold after observing results.
 - explicit approval of the final calculator specification before either
   implementation run.
 
+## Provisioned experiment containers
+
+Manav explicitly authorized two separate containers. They were created fresh
+from `ubuntu-24.04-standard_24.04-2_amd64.tar.zst` and verified stopped:
+
+| Arm | VMID | Hostname | Profile |
+|---|---:|---|---|
+| Control | 102 | `factory-control` | 4 CPU, 6144 MiB RAM, 2048 MiB swap, 64 GiB disk |
+| Treatment | 103 | `factory-dotnet-quality` | 4 CPU, 6144 MiB RAM, 2048 MiB swap, 64 GiB disk |
+
+Both are unprivileged, use firewall-enabled DHCP networking, have `onboot=0`,
+and have no nesting or optional container features. Only identity-bearing fields
+such as VMID, hostname, MAC address, and disk volume differ.
