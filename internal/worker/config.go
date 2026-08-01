@@ -26,14 +26,16 @@ type RepositoryConfig struct {
 }
 
 type Config struct {
-	Server        string                      `toml:"server"`
-	Name          string                      `toml:"name"`
-	Runtime       string                      `toml:"runtime"`
-	MaxConcurrent int                         `toml:"max_concurrent"`
-	DataDirectory string                      `toml:"data_directory"`
-	SourceAccess  []string                    `toml:"source_access"`
-	Repositories  map[string]RepositoryConfig `toml:"repositories"`
-	path          string
+	Server          string                      `toml:"server"`
+	Name            string                      `toml:"name"`
+	Runtime         string                      `toml:"runtime"`
+	MaxConcurrent   int                         `toml:"max_concurrent"`
+	DataDirectory   string                      `toml:"data_directory"`
+	SourceAccess    []string                    `toml:"source_access"`
+	PluginDirectory string                      `toml:"plugin_directory"`
+	EnabledPlugins  []string                    `toml:"enabled_plugins"`
+	Repositories    map[string]RepositoryConfig `toml:"repositories"`
+	path            string
 }
 
 type Repository struct {
@@ -103,6 +105,22 @@ func validateConfig(config Config) error {
 	}
 	if strings.TrimSpace(config.DataDirectory) == "" {
 		return errors.New("data_directory is required")
+	}
+	if config.PluginDirectory != "" && !filepath.IsAbs(config.PluginDirectory) {
+		return errors.New("plugin_directory must be an absolute path")
+	}
+	if len(config.EnabledPlugins) > 0 && config.PluginDirectory == "" {
+		return errors.New("plugin_directory is required when enabled_plugins is not empty")
+	}
+	seenPlugins := make(map[string]bool, len(config.EnabledPlugins))
+	for _, pluginID := range config.EnabledPlugins {
+		if !pluginIDPattern.MatchString(pluginID) {
+			return fmt.Errorf("enabled plugin %q is invalid", pluginID)
+		}
+		if seenPlugins[pluginID] {
+			return fmt.Errorf("enabled plugin %q is duplicated", pluginID)
+		}
+		seenPlugins[pluginID] = true
 	}
 	seenSourceAccess := make(map[string]bool, len(config.SourceAccess))
 	for _, source := range config.SourceAccess {

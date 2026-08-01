@@ -1,0 +1,28 @@
+schema_version = 1
+id = "dotnet-quality"
+version = "0.1.0"
+description = "Review-only .NET quality specialist using pinned dotnet-claude-kit guidance and Roslyn analysis"
+runtime = "codex"
+prompt_file = "prompt.md"
+required_commands = ["dotnet", "cwm-roslyn-navigator"]
+instruction_sets = [
+  "arch-check",
+  "code-review",
+  "convention-learner",
+  "modern-csharp",
+  "security-scan",
+  "testing",
+  "verify",
+]
+context_files = ["codex/agents/dotnet-quality-reviewer.toml"]
+
+[provenance]
+repository = "https://github.com/codewithmukesh/dotnet-claude-kit.git"
+commit = "cd83d315986c27621da178dad73bd95d503c1540"
+license = "MIT"
+
+[[artifacts]]
+kind = "nuget-tool"
+name = "CWM.RoslynNavigator"
+version = "0.7.0"
+source = "https://www.nuget.org/packages/CWM.RoslynNavigator/0.7.0"

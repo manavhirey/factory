@@ -31,6 +31,27 @@ a centrally managed repository does not override an explicit disable.
 Repositories already known before this migration remain enabled for routing
 compatibility.
 
+### Bundled plugins
+
+An operator may activate versioned prompt plugins for one worker:
+
+```toml
+plugin_directory = "/srv/factory/plugins"
+enabled_plugins = ["dotnet-quality"]
+```
+
+`plugin_directory` must be absolute and refer to a real, non-symlink directory.
+The worker loads only explicit IDs, rejects unknown manifest fields and unsafe
+paths, validates pinned provenance and runtime compatibility, and checks every
+declared command before registering healthy. Required commands are checked
+again during periodic health checks.
+
+Plugin context is frozen at worker startup, sorted by ID, and placed between
+Factory's safety preamble and the task prompt. Attempt manifests and start logs
+record the sorted `id@version` set; a control worker records an empty set. The
+MVP does not download plugins, execute plugin hooks, or allow a task/repository
+to activate one. Restart the worker to change its active plugin set.
+
 ## Identity and registration
 
 The first start creates a protected `worker-id` file in the worker data

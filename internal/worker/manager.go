@@ -56,6 +56,7 @@ type Manager struct {
 	repositoriesByKey map[string]Repository
 	client            *client
 	manifests         *manifestStore
+	plugins           []Plugin
 	slots             chan struct{}
 
 	stateMutex           sync.Mutex
@@ -89,6 +90,10 @@ func New(config Config, options Options, logger *slog.Logger) (*Manager, error) 
 		config.Runtime = protocol.RuntimeCodex
 	}
 	if err := validateConfig(config); err != nil {
+		return nil, err
+	}
+	plugins, err := loadPlugins(config, nil)
+	if err != nil {
 		return nil, err
 	}
 	options = options.withDefaults(config.Runtime)
@@ -140,6 +145,7 @@ func New(config Config, options Options, logger *slog.Logger) (*Manager, error) 
 		repositoriesByKey:    byKey,
 		client:               newClient(config.Server, options.HTTPClient),
 		manifests:            newManifestStore(dataDirectory, id),
+		plugins:              plugins,
 		slots:                make(chan struct{}, config.MaxConcurrent),
 		health:               health{State: "unhealthy"},
 		active:               make(map[string]*attemptHandle),
@@ -227,9 +233,7 @@ func (manager *Manager) Run(ctx context.Context) error {
 		case <-timer.C:
 		}
 	}
-	manager.setHealth(checkHealth(ctx, manager.options.GitExecutable,
-		manager.config.Runtime, manager.options.RuntimeExecutable,
-		manager.options.GitHubExecutable, manager.config.SourceAccess))
+	manager.setHealth(manager.checkHealth(ctx))
 	manager.register(ctx)
 
 	healthTicker := time.NewTicker(manager.options.HealthInterval)
@@ -245,9 +249,7 @@ func (manager *Manager) Run(ctx context.Context) error {
 			manager.stopAll("cancelled")
 			return manager.waitForShutdown()
 		case <-healthTicker.C:
-			manager.setHealth(checkHealth(ctx, manager.options.GitExecutable,
-				manager.config.Runtime, manager.options.RuntimeExecutable,
-				manager.options.GitHubExecutable, manager.config.SourceAccess))
+			manager.setHealth(manager.checkHealth(ctx))
 		case <-registrationTicker.C:
 			manager.register(ctx)
 		case <-claimTimer.C:
@@ -257,6 +259,20 @@ func (manager *Manager) Run(ctx context.Context) error {
 			claimTimer.Reset(manager.jitteredPollInterval())
 		}
 	}
+}
+
+func (manager *Manager) checkHealth(ctx context.Context) health {
+	value := checkHealth(ctx, manager.options.GitExecutable,
+		manager.config.Runtime, manager.options.RuntimeExecutable,
+		manager.options.GitHubExecutable, manager.config.SourceAccess)
+	if value.State != "healthy" {
+		return value
+	}
+	if err := checkPluginDependencies(manager.plugins, nil); err != nil {
+		value.State = "unhealthy"
+		value.Error = err
+	}
+	return value
 }
 
 func (manager *Manager) Close() error {
