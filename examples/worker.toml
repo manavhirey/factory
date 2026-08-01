@@ -5,6 +5,11 @@ name = "local"
 runtime = "codex"
 max_concurrent = 1
 data_directory = "workers/local"
+# Bundled plugins are operator-enabled and frozen when the worker starts.
+# plugin_directory must be absolute. Leave enabled_plugins empty for a control
+# worker whose prompt remains unchanged.
+# plugin_directory = "/absolute/path/to/factory/plugins"
+# enabled_plugins = ["dotnet-quality"]
 # No repository or GitHub opt-in is required. Factory advertises GitHub access
 # while `gh auth status --hostname github.com` succeeds and clones centrally
 # managed repositories into this worker's data directory on demand.

@@ -78,6 +78,9 @@ the system does not use WebSockets.
    Node.js.
 10. Polling is read-only. A queue and issue identity creates at most one task,
     including across poller restarts and lost HTTP responses.
+11. Worker plugins are operator-enabled, versioned prompt bundles. They cannot
+    be activated by repository or task content and cannot execute lifecycle
+    code in the MVP.
 
 ## 4. Components and dependencies
 
@@ -138,6 +141,9 @@ manual cleanup, or starts the internal attempt supervisor. The manager:
 - resolves any optional legacy repository paths and normalizes their `origin`
   identities;
 - checks Git and runtime health and automatically probes local GitHub access;
+- loads only explicitly enabled plugins from an operator-managed directory,
+  validates their pinned provenance and prompt assets, and checks required
+  commands before becoming healthy;
 - clones or fetches assigned managed repositories into a bounded cache before
   agent startup;
 - registers every ten seconds and polls for claims every two seconds with
@@ -159,7 +165,10 @@ The worker launches the configured runtime non-interactively:
   prompts.
 
 Both runtimes receive the same generated prompt and produce the same bounded
-event and completion contract.
+event and completion contract. When a worker enables bundled plugins, their
+deterministically ordered prompt context is inserted after Factory's safety
+preamble and before the task description. Empty plugin configuration preserves
+the pre-plugin prompt bytes.
 
 ### Browser UI
 
@@ -178,8 +187,8 @@ Node.js is a contributor dependency only when UI source changes.
 
 1. The server validates its data root, opens SQLite, applies migrations, and
    marks already expired attempts as `lost`.
-2. The worker validates its TOML, data directory, runtime, and any optional
-   legacy repositories.
+2. The worker validates its TOML, data directory, runtime, optional legacy
+   repositories, and explicitly enabled plugin manifests and dependencies.
 3. The worker reconciles durable attempt manifests before accepting new work.
 4. A healthy worker registers its identity, runtime, capacity, provider access,
    managed-repository acquisition capability, optional legacy repositories,
@@ -230,7 +239,8 @@ use its installed provider CLI to update the issue and open a pull request.
    repository. Managed work starts at the fetched remote default-branch commit.
 3. It creates a branch named
    `factory/<task-prefix>-<attempt-prefix>` and an owned worktree.
-4. It writes a protected attempt manifest before starting the runtime.
+4. It writes a protected attempt manifest, including the sorted active plugin
+   identities or an explicit empty set, before starting the runtime.
 5. The internal supervisor starts, then the worker transitions the attempt to
    `running`.
 6. Runtime output is sent as ordered, idempotent event batches.
@@ -408,6 +418,12 @@ The current trust boundary is one trusted user on one host:
 - workers advertise GitHub source access and managed acquisition only after a
   successful local `gh auth status` probe; registrations contain no token;
 - configured source commands and queue prompts are trusted operator policy;
+- the plugin directory, enabled plugin list, manifests, and prompt assets are
+  trusted operator policy. Paths and manifests are validated and symlink
+  traversal is rejected, but the plugin prompt still executes within the same
+  agent context and OS identity as the task;
+- plugins cannot install dependencies or execute hooks during a task. Required
+  command presence is checked at startup and on periodic worker health checks;
 - issue fields are stored in the poller ledger and task prompt as untrusted
   context;
 - lease tokens are random, sent over local HTTP, and stored as SHA-256 digests;
@@ -515,6 +531,7 @@ designs.
 | Database schema | `migrations` |
 | Shared contracts and limits | `internal/protocol` |
 | Worker orchestration | `internal/worker/manager.go`, `registration.go`, `claiming.go`, `attempt_lifecycle.go` |
+| Bundled worker plugins | `internal/worker/plugin.go`, `plugins/` |
 | Runtime supervision | `internal/worker/supervisor.go` |
 | Repository acquisition, Git worktrees, and cleanup | `internal/worker/repository_cache.go`, `git.go`, `reconcile.go`, `cleanup.go` |
 | Durable worker state | `internal/worker/identity.go`, `manifest.go` |

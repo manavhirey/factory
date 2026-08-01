@@ -14,6 +14,14 @@ Start with the root [README](../README.md) to run Factory.
 - [Security policy](../SECURITY.md): reporting and the current trust model.
 - [Contributing](../CONTRIBUTING.md): setup, checks, and pull request standards.
 
+## Fork extensions
+
+- [Bundled plugin system](specs/2026-07-31-plugin-system-design.md): explicit
+  worker activation, manifest/provenance validation, prompt composition, and
+  current MVP limits.
+- [Calculator plugin A/B plan](plans/2026-07-31-calculator-plugin-ab-evaluation.md):
+  matched control/treatment design for the first `dotnet-quality` evaluation.
+
 ## Proposed designs
 
 These documents describe work that is not implemented:

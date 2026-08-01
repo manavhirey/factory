@@ -44,13 +44,14 @@ type attemptManifest struct {
 	ExecutionID string `json:"execution_id"`
 	AttemptID   string `json:"attempt_id"`
 
-	RepositoryID   string `json:"repository_id"`
-	RepositoryKey  string `json:"repository_key"`
-	RepositoryPath string `json:"repository_path"`
-	RemoteIdentity string `json:"remote_identity"`
-	BaseCommit     string `json:"base_commit"`
-	WorktreePath   string `json:"worktree_path"`
-	Branch         string `json:"branch"`
+	RepositoryID   string   `json:"repository_id"`
+	RepositoryKey  string   `json:"repository_key"`
+	RepositoryPath string   `json:"repository_path"`
+	RemoteIdentity string   `json:"remote_identity"`
+	BaseCommit     string   `json:"base_commit"`
+	WorktreePath   string   `json:"worktree_path"`
+	Branch         string   `json:"branch"`
+	ActivePlugins  []string `json:"active_plugins"`
 
 	SupervisorPID        int64     `json:"supervisor_pid,omitempty"`
 	SupervisorIdentity   string    `json:"supervisor_identity,omitempty"`
@@ -585,6 +586,14 @@ func (store *manifestStore) validate(manifest attemptManifest) error {
 	}
 	if strings.TrimSpace(manifest.RepositoryKey) == "" || strings.TrimSpace(manifest.RemoteIdentity) == "" {
 		return errors.New("attempt manifest repository identity is incomplete")
+	}
+	for index, identity := range manifest.ActivePlugins {
+		if !pluginIdentityPattern.MatchString(identity) {
+			return fmt.Errorf("attempt manifest plugin identity %q is invalid", identity)
+		}
+		if index > 0 && manifest.ActivePlugins[index-1] >= identity {
+			return errors.New("attempt manifest plugin identities must be unique and sorted")
+		}
 	}
 	if !filepath.IsAbs(manifest.RepositoryPath) || filepath.Clean(manifest.RepositoryPath) != manifest.RepositoryPath {
 		return errors.New("attempt manifest repository path is not canonical")

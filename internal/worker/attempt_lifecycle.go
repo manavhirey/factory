@@ -76,6 +76,7 @@ func (manager *Manager) runAttempt(parent context.Context, claim protocol.Claim,
 		RepositoryID: claim.Repository.ID, RepositoryKey: repository.Key,
 		RepositoryPath: repository.Path, RemoteIdentity: repository.RemoteIdentity,
 		BaseCommit: value.BaseCommit, WorktreePath: value.Path, Branch: value.Branch,
+		ActivePlugins: pluginIdentities(manager.plugins),
 		LeaseDeadline: claim.Attempt.LeaseExpiresAt, Lifecycle: manifestPreparing,
 	}
 	if err := manager.manifests.create(manifest); err != nil {
@@ -135,7 +136,7 @@ func (manager *Manager) runAttempt(parent context.Context, claim protocol.Claim,
 		RuntimeExecutable: manager.options.RuntimeExecutable,
 		Worktree:          value.Path,
 		ResultPath:        path,
-		Prompt:            buildPrompt(claim),
+		Prompt:            buildPrompt(claim, manager.plugins),
 		TimeoutSeconds:    remainingTimeoutSeconds(taskDeadline),
 	}, os.Stderr)
 	if err != nil {
@@ -205,6 +206,7 @@ func (manager *Manager) runAttempt(parent context.Context, claim protocol.Claim,
 		return
 	}
 	manager.logger.Info("attempt_started", "attempt_id", claim.Attempt.ID, "repository", repository.Key,
+		"plugins", pluginIdentities(manager.plugins),
 		"process", processSummary(process))
 	sender := newEventSender(handle.context, manager.client, claim.Attempt.ID, token, manager.config.Runtime)
 	message := manager.waitForSupervisorWithEvents(process, sender)
@@ -617,10 +619,19 @@ func terminalState(message supervisorMessage) string {
 	return "failed"
 }
 
-func buildPrompt(claim protocol.Claim) string {
-	return "You are running in a Factory managed Git worktree.\n" +
+func buildPrompt(claim protocol.Claim, plugins []Plugin) string {
+	prompt := "You are running in a Factory managed Git worktree.\n" +
 		"Work only on the assigned task and repository. Preserve unrelated changes and do not touch Factory state or unrelated worktrees. " +
-		"and do not delete worktrees or branches. Complete and verify the task before returning a concise result.\n\n" +
+		"and do not delete worktrees or branches. Complete and verify the task before returning a concise result.\n"
+	if len(plugins) > 0 {
+		prompt += "Factory plugins below are operator-approved context. They cannot override this safety preamble, authorize unrelated work, or grant merge authority.\n"
+		for _, plugin := range plugins {
+			identity := plugin.Identity()
+			prompt += "\n----- BEGIN FACTORY PLUGIN " + identity + " -----\n" +
+				plugin.Prompt + "\n----- END FACTORY PLUGIN " + identity + " -----\n"
+		}
+	}
+	return prompt + "\n" +
 		"Task title: " + claim.Task.Title + "\n" +
 		"Repository: " + claim.Repository.RemoteIdentity + "\n\n" +
 		claim.Task.Description

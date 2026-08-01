@@ -120,6 +120,8 @@ Implemented:
 - Go control-plane API and embedded React UI;
 - durable tasks, executions, attempts, leases, events, and cancellation;
 - Codex and Claude Code workers;
+- operator-enabled, versioned worker prompt plugins with pinned provenance,
+  dependency health checks, and attempt evidence;
 - configurable issue queues with GitHub CLI polling and a normalized command
   contract for other provider CLIs;
 - a central managed-repository catalog, bounded worker caches, and isolated Git
@@ -136,6 +138,12 @@ Designed but not implemented:
 
 See the [documentation index](docs/README.md) for current guides and proposed
 designs.
+
+This fork's first extension is the bundled
+[`dotnet-quality`](plugins/dotnet-quality/README.md) review plugin. Its narrow
+MVP contract and matched calculator evaluation are documented in the
+[plugin design](docs/specs/2026-07-31-plugin-system-design.md) and
+[A/B plan](docs/plans/2026-07-31-calculator-plugin-ab-evaluation.md).
 
 ## Development
 
