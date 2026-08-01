@@ -7,8 +7,8 @@
 
 ## Experimental unit
 
-Create two repositories from one immutable starting commit and give them the
-same approved specification:
+Create one immutable local Git seed, copy it into each isolated LXC, and give
+both arms the same approved specification:
 
 - **Control:** Factory fork, `enabled_plugins = []`
 - **Treatment:** same Factory fork commit,
@@ -34,11 +34,22 @@ Required behavior:
 - one application project and one xUnit test project;
 - behavioral tests for all four operations, invalid input, and divide by zero;
 - `dotnet restore --locked-mode`, build, test, format verification, and publish;
-- GitHub Actions runs the same deterministic checks from a pinned SDK setup.
+- the evaluator runs the same deterministic command sequence from a pinned SDK
+  setup in each container.
 
-The full issue/specification text, starting tree, commit metadata, labels, and
-authorization sequence must be byte-identical across arms except for repository
-identity.
+The direct task payload, starting tree, commit metadata, and authorization
+sequence must be byte-identical across arms. Infrastructure identities such as
+VMID and hostname are recorded separately and excluded from the task payload.
+
+## Repository model
+
+This pilot does not use hosted calculator repositories, GitHub issues, pull
+requests, CI, or branch protection. Each LXC receives the same local bare seed
+origin and a working clone at the same paths. Factory registers that clone as a
+local worker repository, receives the task directly through its control plane,
+and may publish the result branch only to the container-local bare origin. The
+origin and all worktrees are disposable experiment artifacts with no external
+remote.
 
 ## Controlled variables
 
@@ -49,7 +60,8 @@ Pin and record for both arms:
 - .NET SDK, NuGet lock, operating-system image, CPU, memory, disk, and timeout;
 - worker concurrency of one and no retained worktree;
 - implementation prompt, acceptance criteria, and human approvals;
-- starting Git commit and repository settings;
+- starting Git commit, local bare-origin contents, paths, and repository
+  settings;
 - network policy and available commands;
 - independent evaluator version and rubric.
 
@@ -116,19 +128,19 @@ revealed. Human review then records any defects the automated evaluator missed.
 
 Record independently of the blinded quality score:
 
-- wall-clock time from authorization to PR;
+- wall-clock time from authorization to frozen result;
 - Codex tokens/cost when available;
 - number and severity of reviewer findings;
 - number of fix/re-review cycles;
 - tool failures, retries, and human interventions;
-- PR readiness, diff size, test count, and changed-file count;
+- evaluator readiness, diff size, test count, and changed-file count;
 - plugin setup and maintenance time.
 
 ## Decision rule
 
 The plugin advances to repeated trials when the treatment:
 
-- violates no human gate or merge boundary;
+- violates no human gate, scope boundary, or external-side-effect boundary;
 - passes all deterministic gates;
 - scores at least as high as control overall;
 - shows a concrete quality gain in at least one correctness, edge-case, test, or
@@ -155,12 +167,10 @@ plugin rather than moving the threshold after observing results.
    compare quality, cost, and safety.
 8. Record gaps and decide whether to repeat, revise, or stop.
 
-## Preconditions requiring Manav's decision
+## Precondition requiring Manav's decision
 
-- whether the two calculator repositories may be public so GitHub's free branch
-  protection can technically enforce PR-only changes;
 - explicit approval of the final calculator specification before either
-  implementation run.
+  implementation run. No hosted calculator repository decision is required.
 
 ## Provisioned experiment containers
 
