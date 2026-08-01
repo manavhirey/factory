@@ -137,6 +137,8 @@ field reliability.
 - vulnerable transitive package scan;
 - publish and start the application;
 - HTTP/browser smoke for success, validation, and divide-by-zero paths;
+- JavaScript-disabled browser/form smoke for successful calculation, validation
+  failure, divide-by-zero handling, and the expected user-visible responses;
 - evaluator-owned screenshots at the frozen narrow-mobile, tablet, and desktop
   viewports, with no clipping or horizontal overflow;
 - automated accessibility checks plus keyboard, focus, and result-announcement
@@ -146,6 +148,14 @@ field reliability.
 - repeatable latency, allocation, and memory measurements using the same
   benchmark inputs and warm-up policy;
 - no secrets, generated artifacts, or unrelated files in Git.
+
+Use the same evaluator-bundled Chromium executable and record its exact version
+and SHA-256 before either arm runs. Standardize screenshots at 390×844,
+768×1024, and 1440×900 CSS pixels, device-pixel ratio 1, 100% zoom, light color
+scheme, and default font scale. Disable extensions and screenshot animations;
+wait for document fonts, network idle, and one additional second of layout
+stability before capture. Store these parameters and any justified deviation in
+the scorecard before reveal.
 
 Hidden tests should cover decimal signs and scale, whitespace/invalid form
 input, division by zero, overflow behavior, repeated submissions, and all four
@@ -179,6 +189,15 @@ After automated evaluation is frozen and before arm identities are revealed,
 present Manav with neutral builds labeled A and B in randomized order. Do not
 show source, plugin logs, implementation metadata, or container names. Keep the
 task script, browser, viewport sizes, data, and available time identical.
+
+Use a new temporary browser profile for each arm with extensions, password
+management, autofill, and synchronization disabled. Before each arm, reset the
+application to its immutable seed state, clear browser storage and cache, open
+the same neutral start URL, perform two unmeasured warm-up page loads, clear all
+fields, and return focus to the document body. Record randomized arm order and
+the reset/warm-up evidence. Because one participant can still learn from the
+first arm, report residual order and learning effects as a limitation rather
+than attributing every preference difference to the plugin.
 
 Manav completes these tasks in both arms:
 
@@ -247,7 +266,9 @@ when the treatment:
 - passes all deterministic gates;
 - has no material regression in dead/smelly code, best-practice adherence,
   reliability, runtime efficiency, UI quality, user experience, security,
-  maintainability, accessibility, or scope;
+  maintainability, accessibility, user defect burden, or scope; the calculator
+  pilot uses escaped defects plus blinded user-assessment defects as the user
+  defect-burden proxy;
 - shows a concrete, evidence-backed gain in at least one of dead/smelly code,
   best-practice adherence, reliability, runtime efficiency, UI quality,
   experience smoothness, or escaped-defect burden; and
@@ -274,6 +295,10 @@ overengineering. End with one recommendation: adopt, continue testing, revise,
 or reject.
 
 ## Execution sequence
+
+This sequence is a proposed procedure only. It does not authorize
+implementation, provisioning, deployment, or an experiment run. Each execution
+phase requires its separately recorded human approval.
 
 1. Implement and test the bundled prompt-plugin loader in the Factory fork.
 2. Build the `dotnet-quality` bundle at pinned third-party revisions.
