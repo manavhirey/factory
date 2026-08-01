@@ -5,8 +5,8 @@
 - Date: 2026-07-31
 - Question: Does the `dotnet-quality` plugin measurably reduce dead or smelly
   code, improve .NET best-practice adherence, reliability, or runtime
-  efficiency, and ultimately reduce defects that reach the user enough to
-  justify its cost and complexity?
+  efficiency, produce a better UI and smoother user experience, and ultimately
+  reduce defects that reach the user enough to justify its cost and complexity?
 
 ## Experimental unit
 
@@ -28,12 +28,22 @@ Build a small ASP.NET Core 10 Razor Pages calculator targeting `net10.0`.
 
 Required behavior:
 
+- provide a complete, visually coherent web front end rather than an API or
+  command-line interface;
 - add, subtract, multiply, and divide two decimal operands;
 - server-side validation for missing and invalid operands;
 - a clear divide-by-zero result without an unhandled exception;
-- keyboard-operable, labeled form and readable result/error state;
+- responsive layouts without horizontal scrolling at narrow mobile, tablet,
+  and desktop widths;
+- clear visual hierarchy, operation controls, input, result, validation, focus,
+  hover, active, disabled, and error states;
+- preserve entered values and provide immediate, understandable feedback after
+  success or failure without jarring layout shifts or duplicate submissions;
+- keyboard-operable, semantically labeled controls, visible focus, readable
+  contrast, and result/error announcements suitable for assistive technology;
 - no persistence, authentication, external services, JavaScript framework, or
-  deployment work;
+  deployment work; small progressive enhancements may use platform JavaScript,
+  but the core calculation flow must remain usable when it is unavailable;
 - one application project and one xUnit test project;
 - behavioral tests for all four operations, invalid input, and divide by zero;
 - `dotnet restore --locked-mode`, build, test, format verification, and publish;
@@ -104,9 +114,11 @@ regression in another outcome.
 | Best-practice adherence | Blinded review against the frozen C#/.NET conventions, analyzer findings, framework usage, error handling, validation, naming, nullability, and test practices | Fewer violations and a higher evidence-backed rubric score |
 | Code reliability | Visible and hidden test results, mutation score, unhandled failures, deterministic repeat runs, and escaped defects found after the Factory result is frozen | More meaningful fault detection and fewer severity-weighted escaped defects |
 | Runtime efficiency | Evaluator-owned repeatable benchmarks for request latency, allocations, and memory after correctness is established | A repeatable material improvement outside measured noise, with no readability or reliability regression |
+| UI quality | Blinded screenshots and interaction review across frozen mobile, tablet, and desktop viewports; visual hierarchy, consistency, responsive behavior, accessibility, and state design | A more coherent, accessible, responsive, and polished interface without needless front-end complexity |
+| Experience reliability and smoothness | Repeated browser task completion, input preservation, focus behavior, layout stability, duplicate-submit protection, client/server errors, perceived responsiveness, and blinded user ratings | Fewer interaction failures and retries, stable feedback, and higher user-rated smoothness and trust |
 | User defect burden | Unique defects reported by Manav after handoff, severity, whether Manav had to diagnose or fix them, time to resolution, and reopened defects | Fewer and less severe user-reported or user-fixed defects |
 
-The calculator pilot can measure the first four outcomes and can approximate the
+The calculator pilot can measure the first six outcomes and can approximate the
 last with a blinded human acceptance session. A credible user-defect claim
 requires a later longitudinal personal-use trial across multiple real tasks;
 the pilot must label its escaped-defect result as a proxy rather than claiming
@@ -125,9 +137,25 @@ field reliability.
 - vulnerable transitive package scan;
 - publish and start the application;
 - HTTP/browser smoke for success, validation, and divide-by-zero paths;
+- JavaScript-disabled browser/form smoke for successful calculation, validation
+  failure, divide-by-zero handling, and the expected user-visible responses;
+- evaluator-owned screenshots at the frozen narrow-mobile, tablet, and desktop
+  viewports, with no clipping or horizontal overflow;
+- automated accessibility checks plus keyboard, focus, and result-announcement
+  verification;
+- repeated browser interaction sequences with no console errors, failed
+  requests, duplicate submissions, stale results, or unexpected input loss;
 - repeatable latency, allocation, and memory measurements using the same
   benchmark inputs and warm-up policy;
 - no secrets, generated artifacts, or unrelated files in Git.
+
+Use the same evaluator-bundled Chromium executable and record its exact version
+and SHA-256 before either arm runs. Standardize screenshots at 390×844,
+768×1024, and 1440×900 CSS pixels, device-pixel ratio 1, 100% zoom, light color
+scheme, and default font scale. Disable extensions and screenshot animations;
+wait for document fonts, network idle, and one additional second of layout
+stability before capture. Store these parameters and any justified deviation in
+the scorecard before reveal.
 
 Hidden tests should cover decimal signs and scale, whitespace/invalid form
 input, division by zero, overflow behavior, repeated submissions, and all four
@@ -146,12 +174,58 @@ Score each arm from 0–3 on:
 7. architecture proportionality and absence of needless abstraction;
 8. reliability and fault-detection strength;
 9. security/input-handling posture;
-10. accessibility and user feedback;
-11. runtime efficiency without quality tradeoffs;
-12. reproducible build quality and scope discipline.
+10. visual design quality and responsive polish;
+11. usability, accessibility, and error recovery;
+12. perceived responsiveness, interaction smoothness, and trust;
+13. runtime efficiency without quality tradeoffs;
+14. reproducible build quality and scope discipline.
 
 The evaluator reports concrete file/line evidence before the arm identities are
 revealed. Human review then records any defects the automated evaluator missed.
+
+### Blinded user assessment
+
+After automated evaluation is frozen and before arm identities are revealed,
+present Manav with neutral builds labeled A and B in randomized order. Do not
+show source, plugin logs, implementation metadata, or container names. Keep the
+task script, browser, viewport sizes, data, and available time identical.
+
+Use a new temporary browser profile for each arm with extensions, password
+management, autofill, and synchronization disabled. Before each arm, reset the
+application to its immutable seed state, clear browser storage and cache, open
+the same neutral start URL, perform two unmeasured warm-up page loads, clear all
+fields, and return focus to the document body. Record randomized arm order and
+the reset/warm-up evidence. Because one participant can still learn from the
+first arm, report residual order and learning effects as a limitation rather
+than attributing every preference difference to the plugin.
+
+Manav completes these tasks in both arms:
+
+1. calculate one result for each operation;
+2. use negative and decimal operands;
+3. trigger invalid-input and divide-by-zero handling, then recover;
+4. complete the primary flow using only the keyboard;
+5. inspect and use the calculator at mobile and desktop sizes; and
+6. repeat calculations quickly enough to expose stale results, duplicate
+   submissions, input loss, or disruptive layout changes.
+
+Immediately after each arm, capture a 1–5 rating and optional comments for:
+
+- visual appeal and coherence;
+- clarity and ease of use;
+- responsive/mobile quality;
+- perceived speed and smoothness;
+- feedback and error recovery;
+- reliability and trust; and
+- overall experience.
+
+Before reveal, ask for A, B, or tie; preference confidence from 1–5; the main
+reason; what felt frustrating; and every defect encountered. Record observed
+task failures in the defect ledger independently of subjective ratings. User
+opinion is primary evidence for UI and experience quality, but it cannot
+override a deterministic correctness, accessibility, security, or safety
+failure. One person's preference is reported as within-person evidence, not a
+claim about all users.
 
 ### Defect ledger
 
@@ -178,6 +252,7 @@ Record independently of the blinded quality score:
 - confirmed reviewer defect yield and false-positive rate;
 - number of fix/re-review cycles;
 - code churn caused by review fixes and any unnecessary abstractions added;
+- browser task completion time, retries, and interaction failures;
 - tool failures, retries, and human interventions;
 - evaluator readiness, diff size, test count, and changed-file count;
 - plugin setup and maintenance time.
@@ -190,10 +265,13 @@ when the treatment:
 - violates no human gate, scope boundary, or external-side-effect boundary;
 - passes all deterministic gates;
 - has no material regression in dead/smelly code, best-practice adherence,
-  reliability, runtime efficiency, security, maintainability, or scope;
+  reliability, runtime efficiency, UI quality, user experience, security,
+  maintainability, accessibility, user defect burden, or scope; the calculator
+  pilot uses escaped defects plus blinded user-assessment defects as the user
+  defect-burden proxy;
 - shows a concrete, evidence-backed gain in at least one of dead/smelly code,
-  best-practice adherence, reliability, runtime efficiency, or escaped-defect
-  burden; and
+  best-practice adherence, reliability, runtime efficiency, UI quality,
+  experience smoothness, or escaped-defect burden; and
 - does not add more than 50% wall-clock/token cost without a material quality
   benefit.
 
@@ -210,12 +288,17 @@ than moving thresholds after observing results.
 
 Produce a treatment-minus-control report containing raw measurements,
 normalized deltas, concrete code examples, uncertainty and evaluator caveats,
-confirmed benefits, and costs. The costs section must include added runtime,
-tokens, setup and maintenance work, false positives, code churn, tool failures,
-and signs of overengineering. End with one recommendation: adopt, continue
-testing, revise, or reject.
+confirmed benefits, screenshots, blinded user ratings and preference, and
+costs. The costs section must include added runtime, tokens, setup and
+maintenance work, false positives, code churn, tool failures, and signs of
+overengineering. End with one recommendation: adopt, continue testing, revise,
+or reject.
 
 ## Execution sequence
+
+This sequence is a proposed procedure only. It does not authorize
+implementation, provisioning, deployment, or an experiment run. Each execution
+phase requires its separately recorded human approval.
 
 1. Implement and test the bundled prompt-plugin loader in the Factory fork.
 2. Build the `dotnet-quality` bundle at pinned third-party revisions.
@@ -226,11 +309,12 @@ testing, revise, or reject.
 5. Validate an empty control plugin set and one treatment plugin set in worker
    health, prompt snapshots, logs, and manifests.
 6. Randomize run order, record the assignment privately, and run both arms.
-7. Freeze final commits, perform blinded evaluation, reveal assignment, and
-   compare quality, cost, and safety.
-8. Produce the required pros/cons decision report and decide whether to repeat,
+7. Freeze final commits and perform the automated blinded evaluation.
+8. Conduct Manav's blinded A/B user assessment, freeze his ratings, preference,
+   comments, and reported defects, then reveal the assignment.
+9. Produce the required pros/cons decision report and decide whether to repeat,
    revise, or stop.
-9. If repeated trials justify it, run a separate longitudinal personal-use phase
+10. If repeated trials justify it, run a separate longitudinal personal-use phase
    to measure user-reported and user-fixed defects before calling the plugin a
    great Factory addition.
 
