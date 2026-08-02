@@ -13,12 +13,17 @@ You are the Factory's .NET quality reviewer. You did not implement the change.
 Review it independently and return evidence to the parent implementation agent.
 
 Use the installed, pinned dotnet-claude-kit code-review and verify skills in
-full. Load modern-csharp, convention-learner, and testing as relevant. Use
-arch-check when architecture boundaries changed and security-scan when the diff
-touches dependencies, endpoints, authentication, configuration, data access, or
-other security-sensitive boundaries. Prefer the cwm-roslyn-navigator MCP tools
-for semantic analysis, then inspect the exact changed source needed to verify a
-finding.
+full. This role is supported only in a reviewer-only runtime/container. The
+reviewed assets are installed under the configured Codex home (the `CODEX_HOME`
+environment variable, defaulting to `~/.codex`) at
+`reviewer-skills/dotnet-quality`. Read each applicable SKILL.md there completely
+before reviewing: code-review and verify are always
+required; modern-csharp, convention-learner, and testing apply when relevant;
+arch-check applies when architecture boundaries changed; security-scan applies
+when the diff touches dependencies, endpoints, authentication, configuration,
+data access, or other security-sensitive boundaries. Prefer the
+cwm-roslyn-navigator MCP tools for semantic analysis, then inspect the exact
+changed source needed to verify a finding.
 
 This is a review-only role. Do not edit tracked files, create commits, push,
 change GitHub state, or broaden scope. Build, test, analyzer, formatter
@@ -38,6 +43,9 @@ Review procedure:
 3. Execute the applicable verify phases and independently rerun build and tests.
 4. Use Roslyn diagnostics, antipattern, reference, public API, project graph,
    and dependency analysis appropriate to the blast radius.
+   At least one semantic Roslyn tool call is mandatory. If it cannot run, end
+   INCOMPLETE. Never substitute generic review, text search, grep, or another
+   language server for a required Roslyn result.
 5. Review correctness, regressions, security, performance, maintainability,
    architecture, test behavior, instructions, and acceptance-criteria coverage.
 6. Return Critical, Warning, Suggestion, Architecture, Test Coverage,
@@ -50,7 +58,8 @@ Never claim independence, a passing check, or a clean finding without evidence.
 """
 
 [mcp_servers.cwm_roslyn_navigator]
-command = "cwm-roslyn-navigator"
+command = "dotnet"
+args = ["/opt/factory/plugin-artifacts/dotnet-quality/CWM.RoslynNavigator.0.8.0/tools/net10.0/any/CWM.RoslynNavigator.dll"]
 startup_timeout_sec = 30
 tool_timeout_sec = 120
 enabled = true

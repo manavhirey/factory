@@ -37,6 +37,7 @@ An operator may activate versioned prompt plugins for one worker:
 
 ```toml
 plugin_directory = "/srv/factory/plugins"
+plugin_artifact_directory = "/opt/factory/plugin-artifacts"
 enabled_plugins = ["dotnet-quality"]
 ```
 
@@ -51,6 +52,15 @@ Factory's safety preamble and the task prompt. Attempt manifests and start logs
 record the sorted `id@version` set; a control worker records an empty set. The
 MVP does not download plugins, execute plugin hooks, or allow a task/repository
 to activate one. Restart the worker to change its active plugin set.
+
+The `dotnet-quality` plugin is supported only in a reviewer-only container. The
+worker verifies installed Codex agent and reviewer assets against the complete
+reviewed bundle, verifies the retained NuGet package and executable DLL by
+SHA-256, rejects symlinked/foreign-owned/writable path components, and uses the
+agent's actual command, arguments, and environment for a bounded MCP semantic
+probe against the bundled smoke solution. Any mismatch or failed probe makes
+the worker unhealthy and is rechecked periodically. Shell/interpreter commands
+cannot be supplied by the health-check manifest.
 
 ## Identity and registration
 

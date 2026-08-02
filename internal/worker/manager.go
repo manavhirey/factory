@@ -268,7 +268,7 @@ func (manager *Manager) checkHealth(ctx context.Context) health {
 	if value.State != "healthy" {
 		return value
 	}
-	if err := checkPluginDependencies(manager.plugins, nil); err != nil {
+	if err := checkPluginActivation(ctx, manager.plugins, nil, nil, ""); err != nil {
 		value.State = "unhealthy"
 		value.Error = err
 	}

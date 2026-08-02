@@ -49,6 +49,7 @@ Each worker configuration gains:
 
 ```toml
 plugin_directory = "/absolute/operator-managed/path/to/plugins"
+plugin_artifact_directory = "/opt/factory/plugin-artifacts"
 enabled_plugins = ["dotnet-quality"]
 ```
 
@@ -64,12 +65,16 @@ Only explicitly enabled IDs are loaded. The initial schema is:
 ```toml
 schema_version = 1
 id = "dotnet-quality"
-version = "0.1.0"
+version = "0.2.0"
 description = "Review-only .NET quality specialist"
 runtime = "codex"
 prompt_file = "prompt.md"
-required_commands = ["dotnet", "cwm-roslyn-navigator"]
+required_commands = ["dotnet"]
 instruction_sets = ["code-review", "verify"]
+reviewer_assets = [
+  "reviewer-skills/code-review/SKILL.md",
+  "reviewer-skills/verify/SKILL.md",
+]
 context_files = ["codex/agents/dotnet-quality-reviewer.toml"]
 
 [provenance]
@@ -80,21 +85,43 @@ license = "MIT"
 [[artifacts]]
 kind = "nuget-tool"
 name = "CWM.RoslynNavigator"
-version = "0.7.0"
-source = "https://www.nuget.org/packages/CWM.RoslynNavigator/0.7.0"
+version = "0.8.0"
+source = "https://api.nuget.org/v3-flatcontainer/cwm.roslynnavigator/0.8.0/cwm.roslynnavigator.0.8.0.nupkg"
+package_file = "CWM.RoslynNavigator.0.8.0.nupkg"
+package_sha256 = "18432346439a1f1a1fdc1b82f7f944a4e6f4202347a2cfece7ee75992530cfcd"
+extracted_directory = "CWM.RoslynNavigator.0.8.0"
+executable_file = "CWM.RoslynNavigator.0.8.0/tools/net10.0/any/CWM.RoslynNavigator.dll"
+executable_sha256 = "becde1c2c2b4a478f099d16f5c5dc426365fa4c7d8c0d656fe7e031086b2bb5d"
+
+[[health_checks]]
+kind = "roslyn-navigator-mcp"
+context_file = "codex/agents/dotnet-quality-reviewer.toml"
+mcp_server = "cwm_roslyn_navigator"
+artifact = "CWM.RoslynNavigator"
+working_directory = "smoke"
+required_tools = ["find_symbol", "get_diagnostics"]
+semantic_tool = "find_symbol"
+semantic_args_json = '{"name":"ReviewerHealthMarker","kind":"type"}'
+expected_result_contains = "ReviewerHealthMarker"
 ```
 
 Validation rules:
 
 - IDs and versions use a narrow ASCII grammar and bounded lengths.
-- `plugin_directory` and plugin directories are real directories, not symlinks.
+- Plugin, artifact, installed-agent, and reviewer-asset paths must remain below
+  their canonical roots with no symlink component, foreign owner, or
+  group/world-writable component.
 - `prompt_file` is a regular file below its plugin directory, never a symlink,
   and is size-bounded. Canonical-path validation prevents traversal.
 - Every declared `context_file` receives the same containment and non-symlink
   validation. Deployment may install these reviewed assets into a
   runtime-specific location; Factory never copies them into a product repo.
-- Required commands are basenames, not paths or shell snippets, and must exist
-  on `PATH` during health checks.
+- Health checks cannot declare commands or shell arguments. The Roslyn check is
+  tied to a retained official nupkg and executable DLL by exact SHA-256 and
+  verifies the complete extracted tree against the archive with no extra
+  files before executing only `dotnet <verified absolute DLL>`. It reuses the reviewed
+  agent's actual arguments and environment, overrides only cwd to the bundled
+  smoke solution, and requires initialize, tools/list, and a semantic call.
 - The plugin runtime must exactly match the worker runtime.
 - Provenance repository, exact 40-character commit, and license are required.
 - Unknown TOML fields are rejected so misspelled safety settings do not vanish.
@@ -137,18 +164,24 @@ files or mutate GitHub. The implementation agent owns a maximum of three
 fix/re-review cycles. Only `PASS` permits a normal ready-for-human-review PR;
 other verdicts permit at most a draft PR with the incomplete gate disclosed.
 
+The complete reviewer asset closure is declared in `reviewer_assets`, including
+transitive references. Assets are copied below `CODEX_HOME` in a reviewer-only
+runtime and checked byte-for-byte against the bundle. Worker health also fails
+on agent drift, artifact drift, unsafe paths/modes/ownership, MCP framing
+failure, or semantic unavailability.
+
 The kit's Claude plugin, hooks, templates, auto-format-on-edit behavior, and
 restore-on-edit behavior are outside the plugin. The fork consumes only the
 reviewed instruction subset and Roslyn tool declared in the plugin bundle.
 
-## Isolation limitation
+## Reviewer-only deployment boundary
 
-The current non-nesting Proxmox LXC blocks Codex's Bubblewrap namespaces, so a
-nested Codex reviewer cannot rely on the normal read-only sandbox there. During
-the personal pilot, review-only behavior is prompt-enforced inside an
-unprivileged LXC under a non-root account with no host mounts. Do not describe
-the reviewer as an independently permissioned identity. Work portability
-requires a stronger executor or separate reviewer identity.
+Same-user filesystem placement is not an isolation boundary. This plugin must
+never be enabled in an implementation runtime. Experiment 003 exports immutable
+commits and fully recreates the LXC between implementation, review, fix, and
+re-review; plugin assets exist only in review-phase containers. The nested
+reviewer remains prompt-enforced inside that disposable unprivileged LXC and is
+not an independently permissioned identity.
 
 ## Compatibility and upstream sync
 
@@ -168,9 +201,11 @@ until matched experiments demonstrate the need.
 - An empty enabled set produces the pre-plugin prompt bytes.
 - A valid enabled plugin adds one deterministic, delimited prompt section.
 - Attempt manifests and logs distinguish `[]` from
-  `["dotnet-quality@0.1.0"]`.
+  `["dotnet-quality@0.2.0"]`.
 - Invalid, missing, incompatible, symlinked, traversing, oversized, or
   dependency-incomplete plugins prevent claims.
+- A plugin with a missing/drifted asset or artifact, unsafe path, protocol
+  failure, or semantically unavailable specialist prevents claims.
 - Plugin configuration cannot execute shell, install software, or mutate a
   repository.
 - The control/treatment calculator experiment can run on the same Factory fork

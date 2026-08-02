@@ -13,6 +13,8 @@ func ensureSupportedPlatform() error {
 	return errors.New("factory-worker is supported only on Unix")
 }
 
+func validatePathOwner(os.FileInfo, string) error { return ensureSupportedPlatform() }
+
 func ShutdownSignals() []os.Signal                           { return []os.Signal{os.Interrupt} }
 func lockFile(*os.File) error                                { return ensureSupportedPlatform() }
 func unlockFile(*os.File) error                              { return nil }
@@ -23,5 +25,7 @@ func processGroupID(int) (int, error)                        { return 0, ensureS
 func processIdentity(int) (string, error)                    { return "", ensureSupportedPlatform() }
 func verifyProcessIdentity(int, string) error                { return ensureSupportedPlatform() }
 func processGroupAlive(int) bool                             { return false }
+func processAlive(int) bool                                  { return false }
+func stopLeaderlessProcessGroup(int, time.Duration) error    { return ensureSupportedPlatform() }
 func forceStopStartedProcessGroup(int) error                 { return ensureSupportedPlatform() }
 func stopOwnedProcessGroup(int, string, time.Duration) error { return ensureSupportedPlatform() }
