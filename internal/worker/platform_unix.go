@@ -17,6 +17,20 @@ import (
 
 func ensureSupportedPlatform() error { return nil }
 
+func validatePathOwner(info os.FileInfo, name string) error {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("inspect %s ownership", name)
+	}
+	if int(stat.Uid) != os.Geteuid() {
+		return fmt.Errorf("%s must be owned by worker uid %d", name, os.Geteuid())
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%s must not be group- or world-writable", name)
+	}
+	return nil
+}
+
 func ShutdownSignals() []os.Signal {
 	return []os.Signal{os.Interrupt, syscall.SIGTERM}
 }
@@ -99,6 +113,25 @@ func forceStopStartedProcessGroup(processGroupID int) error {
 func processGroupAlive(processGroupID int) bool {
 	err := unix.Kill(-processGroupID, 0)
 	return err == nil || errors.Is(err, unix.EPERM)
+}
+
+func processAlive(pid int) bool {
+	err := unix.Kill(pid, 0)
+	return err == nil || errors.Is(err, unix.EPERM)
+}
+
+func stopLeaderlessProcessGroup(processGroupID int, grace time.Duration) error {
+	if err := signalProcessGroup(processGroupID, unix.SIGTERM); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(grace)
+	for grace > 0 && time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+		if !processGroupAlive(processGroupID) {
+			return nil
+		}
+	}
+	return signalProcessGroup(processGroupID, unix.SIGKILL)
 }
 
 func stopOwnedProcessGroup(pid int, identity string, grace time.Duration) error {

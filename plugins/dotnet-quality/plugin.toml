@@ -1,10 +1,10 @@
 schema_version = 1
 id = "dotnet-quality"
-version = "0.1.0"
+version = "0.2.0"
 description = "Review-only .NET quality specialist using pinned dotnet-claude-kit guidance and Roslyn analysis"
 runtime = "codex"
 prompt_file = "prompt.md"
-required_commands = ["dotnet", "cwm-roslyn-navigator"]
+required_commands = ["dotnet"]
 instruction_sets = [
   "arch-check",
   "code-review",
@@ -14,7 +14,28 @@ instruction_sets = [
   "testing",
   "verify",
 ]
+reviewer_assets = [
+  "reviewer-skills/arch-check/SKILL.md",
+  "reviewer-skills/code-review/SKILL.md",
+  "reviewer-skills/convention-learner/SKILL.md",
+  "reviewer-skills/modern-csharp/SKILL.md",
+  "reviewer-skills/security-scan/SKILL.md",
+  "reviewer-skills/security-scan/references/scan-layers.md",
+  "reviewer-skills/testing/SKILL.md",
+  "reviewer-skills/verify/SKILL.md",
+]
 context_files = ["codex/agents/dotnet-quality-reviewer.toml"]
+
+[[health_checks]]
+kind = "roslyn-navigator-mcp"
+context_file = "codex/agents/dotnet-quality-reviewer.toml"
+mcp_server = "cwm_roslyn_navigator"
+artifact = "CWM.RoslynNavigator"
+working_directory = "smoke"
+required_tools = ["detect_antipatterns", "find_references", "find_symbol", "get_diagnostics"]
+semantic_tool = "find_symbol"
+semantic_args_json = '{"name":"ReviewerHealthMarker","kind":"type"}'
+expected_result_contains = "ReviewerHealthMarker"
 
 [provenance]
 repository = "https://github.com/codewithmukesh/dotnet-claude-kit.git"
@@ -24,5 +45,10 @@ license = "MIT"
 [[artifacts]]
 kind = "nuget-tool"
 name = "CWM.RoslynNavigator"
-version = "0.7.0"
-source = "https://www.nuget.org/packages/CWM.RoslynNavigator/0.7.0"
+version = "0.8.0"
+source = "https://api.nuget.org/v3-flatcontainer/cwm.roslynnavigator/0.8.0/cwm.roslynnavigator.0.8.0.nupkg"
+package_file = "CWM.RoslynNavigator.0.8.0.nupkg"
+package_sha256 = "18432346439a1f1a1fdc1b82f7f944a4e6f4202347a2cfece7ee75992530cfcd"
+extracted_directory = "CWM.RoslynNavigator.0.8.0"
+executable_file = "CWM.RoslynNavigator.0.8.0/tools/net10.0/any/CWM.RoslynNavigator.dll"
+executable_sha256 = "becde1c2c2b4a478f099d16f5c5dc426365fa4c7d8c0d656fe7e031086b2bb5d"

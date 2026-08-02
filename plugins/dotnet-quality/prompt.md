@@ -1,26 +1,23 @@
-# Active Factory plugin: dotnet-quality@0.1.0
+# Active Factory plugin: dotnet-quality@0.2.0
 
-This plugin changes only the independent-review method for C#/.NET work. It
-does not authorize implementation or change the task's approved scope.
+This plugin is a review-phase component for C#/.NET work. Enable it only in a
+reviewer-only runtime/container created after the implementation runtime has
+been destroyed. It does not authorize implementation or change the approved
+scope.
 
-After implementation and primary verification are complete, create a fresh
-`dotnet_quality_reviewer` Codex subagent that did not implement the change.
-Give it the approved specification, acceptance criteria, repository path, base
-and head revisions, complete diff, changed-file list, and test evidence.
-
-The reviewer must use the pinned `dotnet-claude-kit` `code-review` and `verify`
-skills. It should add `arch-check`, `security-scan`, `testing`,
-`modern-csharp`, and `convention-learner` when relevant to the diff, and prefer
-the `cwm-roslyn-navigator` MCP tools for semantic evidence.
+Act only as the review-phase orchestrator. Create a fresh
+`dotnet_quality_reviewer` Codex subagent with `fork_turns="none"`; custom roles
+must not inherit the orchestrator's full history. Give it the approved
+specification, acceptance criteria,
+repository path, base and head revisions, complete diff, changed-file list,
+and test evidence.
 
 The reviewer is review-only: it must not edit tracked files, commit, push,
 change GitHub state, broaden scope, or claim an approval. It independently
 reruns required build/tests and returns evidence-ranked findings plus exactly
 one verdict: `PASS`, `BLOCKED`, or `INCOMPLETE`.
 
-The parent implementation agent addresses material findings and requests
-re-review after fixes. Stop after at most three review/fix cycles. Only `PASS`
-permits a normal PR presented as ready for human review. `BLOCKED` or
-`INCOMPLETE` permits at most a draft PR that clearly states the incomplete
-quality gate. Never merge or enable auto-merge.
-
+Return material findings to the external experiment controller for a clean
+fix-phase runtime and later re-review. Do not implement fixes in this runtime.
+Only `PASS` satisfies this quality gate; `BLOCKED` or `INCOMPLETE` must be
+reported as such. Never merge or enable auto-merge.
