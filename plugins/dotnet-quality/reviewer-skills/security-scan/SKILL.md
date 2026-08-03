@@ -72,9 +72,10 @@ reference. Do not delegate to agents or skills outside this reviewer bundle.
 Severity must match actual risk — over-classification causes alert fatigue and
 buries the real Critical:
 
-- Exclude only documented placeholders and generated fake values. A tracked
-  non-placeholder credential is reportable even when it appears in a test
-  fixture or development configuration.
+- Exclude only documented placeholders, generated fake values, and non-secret
+  `UserSecretsId` identifiers as defined by the authoritative layer reference.
+  A tracked non-placeholder credential is reportable even when it appears in a
+  test fixture or development configuration.
 - A missing XML comment is never a security finding
 - Reserve Critical for exploitable-now issues: injection on public endpoints,
   exposed production secrets, auth bypass

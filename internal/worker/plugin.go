@@ -578,7 +578,7 @@ func validatePluginManifest(manifest pluginManifest, enabledID, runtime string) 
 	for index, artifact := range manifest.Artifacts {
 		if !pluginAssetPattern.MatchString(artifact.Name) ||
 			strings.TrimSpace(artifact.Version) == "" || len(artifact.Version) > 100 {
-			return fmt.Errorf("artifact %d has invalid kind, name, or version", index+1)
+			return fmt.Errorf("artifact %d has invalid name or version", index+1)
 		}
 		if err := validateHTTPSURL(artifact.Source, fmt.Sprintf("artifact %d source", index+1)); err != nil {
 			return err
@@ -1228,7 +1228,7 @@ func validateSecureDirectoryComponents(path, name string) error {
 		if !ok || (owner != 0 && owner != os.Geteuid()) {
 			return fmt.Errorf("%s component %q has an untrusted owner", name, current)
 		}
-		if info.Mode().Perm()&0o022 != 0 && !(owner == 0 && info.Mode()&os.ModeSticky != 0) {
+		if info.Mode().Perm()&0o022 != 0 && (owner != 0 || info.Mode()&os.ModeSticky == 0) {
 			return fmt.Errorf("%s component %q must not be group- or world-writable", name, current)
 		}
 	}

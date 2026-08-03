@@ -65,7 +65,7 @@ Factory scanned the canonical plugin bundle, `/opt/factory/plugin-artifacts`,
 and the installed agent/reviewer trees below Codex home. Validation files were
 worker-owned mode `0600` and directories mode `0700`. The reviewed agent plus
 sorted reviewer-asset hash-list digest was
-`2f0cf9248e1b551ad362662a188ce3f9687f129caae8863ad39603d09ebaa927`;
+`877630c67a15758a43cabda0b8868bfc337c9dc9a9b9d13502961b9506596a9f`;
 the manifest remains the canonical complete list of its eight asset files.
 
 ## Review remediation and clean semantic rebuild
