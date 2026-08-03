@@ -421,7 +421,7 @@ func TestSecureDirectoryRejectsUserOwnedSymlinkAncestor(t *testing.T) {
 }
 
 func TestLoadCodexMCPServerRejectsRunnerInjectionEnvironment(t *testing.T) {
-	for _, key := range []string{"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "DOTNET_STARTUP_HOOKS", "DOTNET_ADDITIONAL_DEPS"} {
+	for _, key := range []string{"LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "DOTNET_STARTUP_HOOKS", "DOTNET_ADDITIONAL_DEPS", "DOTNET_ROOT", "DOTNET_ROOT_X64", "DOTNET_HOST_PATH", "CORECLR_PROFILER_PATH", "COMPlus_ReadyToRun"} {
 		t.Run(key, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "agent.toml")
 			body := fmt.Sprintf("name = \"reviewer\"\ndescription = \"review\"\nmodel_reasoning_effort = \"high\"\nsandbox_mode = \"read-only\"\ndeveloper_instructions = \"review\"\n[mcp_servers.roslyn]\ncommand = %q\nargs = [\"/tool.dll\"]\nenv = {%s = \"unsafe\"}\nstartup_timeout_sec = 1\ntool_timeout_sec = 1\nenabled = true\nrequired = true\n", dotnetRunnerPath, key)
@@ -490,6 +490,7 @@ func TestProbeMCPServerRequiresCleanProtocolAndSemanticCall(t *testing.T) {
 	}{
 		{name: "semantic success", mode: "success"},
 		{name: "notification burst", mode: "notifications"},
+		{name: "inherited loader environment sanitized", mode: "reject-loader-env"},
 		{name: "stdout log corruption", mode: "polluted", want: "not valid MCP JSON"},
 		{name: "partial stdout", mode: "partial", want: "not valid MCP JSON"},
 		{name: "early exit", mode: "exit", want: "not valid MCP JSON"},
@@ -503,6 +504,11 @@ func TestProbeMCPServerRequiresCleanProtocolAndSemanticCall(t *testing.T) {
 		{name: "timeout", mode: "timeout", want: "deadline exceeded", timeout: 250 * time.Millisecond},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			if test.mode == "reject-loader-env" {
+				for _, key := range []string{"LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "DOTNET_STARTUP_HOOKS", "DOTNET_ADDITIONAL_DEPS", "DOTNET_ROOT", "DOTNET_ROOT_X64", "DOTNET_HOST_PATH", "CORECLR_PROFILER_PATH", "COMPlus_ReadyToRun"} {
+					t.Setenv(key, "/unreviewed/injection")
+				}
+			}
 			timeout := test.timeout
 			if timeout == 0 {
 				timeout = 5 * time.Second
@@ -583,6 +589,14 @@ func TestMCPProbeHelperProcess(t *testing.T) {
 		return
 	}
 	mode := os.Args[len(os.Args)-1]
+	if mode == "reject-loader-env" {
+		for _, key := range []string{"LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "DOTNET_STARTUP_HOOKS", "DOTNET_ADDITIONAL_DEPS", "DOTNET_ROOT", "DOTNET_ROOT_X64", "DOTNET_HOST_PATH", "CORECLR_PROFILER_PATH", "COMPlus_ReadyToRun"} {
+			if os.Getenv(key) != "" {
+				os.Exit(9)
+			}
+		}
+		mode = "success"
+	}
 	if mode == "stderr-exit" {
 		fmt.Fprintln(os.Stderr, "diagnostic marker")
 		return

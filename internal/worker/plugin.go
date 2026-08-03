@@ -661,8 +661,7 @@ func loadCodexMCPServer(path, serverName string) (codexMCPServer, error) {
 		if strings.TrimSpace(key) == "" || strings.Contains(key, "=") || strings.ContainsRune(value, '\x00') {
 			return codexMCPServer{}, errors.New("MCP server env contains an invalid entry")
 		}
-		if key == "LD_PRELOAD" || strings.HasPrefix(key, "DYLD_") || key == "DOTNET_STARTUP_HOOKS" ||
-			key == "DOTNET_ADDITIONAL_DEPS" {
+		if forbiddenMCPEnvironmentKey(key) {
 			return codexMCPServer{}, fmt.Errorf("MCP server env %q may not alter runner loading", key)
 		}
 	}
@@ -852,7 +851,7 @@ func verifyFileSHA256(root, path, expected, name string) error {
 func probeMCPServer(ctx context.Context, spec mcpProbeSpec) (returnErr error) {
 	command := exec.Command(spec.Executable, spec.Arguments...)
 	command.Dir = spec.WorkingDir
-	command.Env = append(os.Environ(), sortedEnvironment(spec.Environment)...)
+	command.Env = append(sanitizedMCPEnvironment(os.Environ()), sortedEnvironment(spec.Environment)...)
 	configureNewProcessGroup(command)
 	stdin, err := command.StdinPipe()
 	if err != nil {
@@ -1304,6 +1303,25 @@ func sortedEnvironment(environment map[string]string) []string {
 		values = append(values, key+"="+environment[key])
 	}
 	return values
+}
+
+func sanitizedMCPEnvironment(environment []string) []string {
+	sanitized := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		key, _, found := strings.Cut(entry, "=")
+		if found && forbiddenMCPEnvironmentKey(key) {
+			continue
+		}
+		sanitized = append(sanitized, entry)
+	}
+	return sanitized
+}
+
+func forbiddenMCPEnvironmentKey(key string) bool {
+	return key == "LD_PRELOAD" || key == "LD_LIBRARY_PATH" || strings.HasPrefix(key, "DYLD_") ||
+		key == "DOTNET_STARTUP_HOOKS" || key == "DOTNET_ADDITIONAL_DEPS" || key == "DOTNET_ROOT" ||
+		strings.HasPrefix(key, "DOTNET_ROOT_") || key == "DOTNET_HOST_PATH" ||
+		strings.HasPrefix(key, "CORECLR_") || strings.HasPrefix(key, "COMPlus_")
 }
 
 func pathWithin(root, candidate string) bool {
