@@ -50,7 +50,7 @@ line count. A one-line middleware change outranks a 300-line rename.
 
 ### Step 2: MCP Analysis (before reading any file)
 
-```
+```text
 detect_antipatterns(projectFilter: "affected-project")   → async void, DateTime.Now, new HttpClient(), broad catch
 get_diagnostics(scope: "project", path: "affected-project") → new warnings, nullability issues
 ```
@@ -61,7 +61,7 @@ Distinguish newly introduced findings from pre-existing ones — focus on new.
 
 For each modified public API:
 
-```
+```text
 find_references(symbolName: "ModifiedType")              → count consumers; high count = high risk
 get_dependency_graph(symbolName: "ModifiedMethod", depth: 2) → ripple effects
 ```
@@ -126,7 +126,7 @@ bury a security bug under naming nits.
 
 ## Example
 
-```
+```text
 User: /code-review the changes in this PR
 
 Claude: 7 changed files across 3 projects. CreateOrder touches data access

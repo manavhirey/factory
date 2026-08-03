@@ -10,7 +10,13 @@ description: >
   "Verify", "test coverage", "AAA pattern", "WireMock", or "FakeTimeProvider".
 ---
 
-# Testing (.NET 10)
+# Testing (.NET)
+
+Apply the .NET 10 and xUnit v3 examples only when the target project is
+`net10.0` and references compatible xUnit v3 packages. For xUnit v2, use its
+Task-based `IAsyncLifetime.InitializeAsync()` and `DisposeAsync()` APIs instead
+of copying the ValueTask fixture signatures below. For NUnit, MSTest, or another
+test framework, use that framework's own setup and teardown lifecycle APIs.
 
 ## Core Principles
 
@@ -99,8 +105,14 @@ public class ApiFixture : WebApplicationFactory<Program>, IAsyncLifetime
     // ValueTask DisposeAsync that WebApplicationFactory already provides
     public override async ValueTask DisposeAsync()
     {
-        await _postgres.DisposeAsync();
-        await base.DisposeAsync();
+        try
+        {
+            await base.DisposeAsync();
+        }
+        finally
+        {
+            await _postgres.DisposeAsync();
+        }
     }
 }
 ```

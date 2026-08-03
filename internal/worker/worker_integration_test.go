@@ -331,6 +331,30 @@ func TestGitHubSourceAccessIsAdvertisedOnlyAfterSuccessfulProbe(t *testing.T) {
 	}
 }
 
+func TestManagerHealthBecomesUnhealthyWhenPluginSemanticProbeFails(t *testing.T) {
+	t.Setenv("FACTORY_MCP_PROBE_HELPER", "1")
+	codexPath := filepath.Join(t.TempDir(), "codex")
+	writeFakeCodex(t, codexPath)
+	manager := &Manager{
+		config:  Config{Runtime: protocol.RuntimeCodex},
+		options: Options{GitExecutable: "git", RuntimeExecutable: codexPath, GitHubExecutable: filepath.Join(t.TempDir(), "missing-gh")},
+		plugins: []Plugin{
+			{ID: "dotnet-quality", HealthChecks: []PluginHealthCheck{
+				{
+					Command: os.Args[0], Arguments: []string{"-test.run=TestMCPProbeHelperProcess", "--", "tool-error"},
+					RequiredTools: []string{"find_symbol"}, SemanticTool: "find_symbol",
+					SemanticArgs: json.RawMessage(`{"name":"ReviewerHealthMarker"}`), ExpectedResult: "ReviewerHealthMarker",
+					StartupTimeout: 2,
+				},
+			}},
+		},
+	}
+	value := manager.checkHealth(context.Background())
+	if value.State != "unhealthy" || value.Error == nil || !strings.Contains(value.Error.Error(), "isError=true") {
+		t.Fatalf("manager plugin health = %#v", value)
+	}
+}
+
 func TestZeroRepositoryWorkerAcquiresCentrallyManagedGitHubRepository(t *testing.T) {
 	upstream := createRepository(t, "cattle")
 	fixture := newServerFixture(t, nil)

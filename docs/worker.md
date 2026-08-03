@@ -42,6 +42,9 @@ enabled_plugins = ["dotnet-quality"]
 ```
 
 `plugin_directory` must be absolute and refer to a real, non-symlink directory.
+`plugin_artifact_directory` is mandatory when any enabled plugin declares a
+pinned artifact; it is canonicalized once and used for both integrity checks
+and execution paths.
 The worker loads only explicit IDs, rejects unknown manifest fields and unsafe
 paths, validates pinned provenance and runtime compatibility, and checks every
 declared command before registering healthy. Required commands are checked

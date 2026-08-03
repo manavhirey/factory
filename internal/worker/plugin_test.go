@@ -20,6 +20,14 @@ import (
 	"github.com/owainlewis/factory/internal/protocol"
 )
 
+func TestPluginActivationUsesExplicitCodexHomeWithoutUserHome(t *testing.T) {
+	t.Setenv("HOME", "")
+	t.Setenv("CODEX_HOME", "")
+	if err := checkPluginActivation(context.Background(), nil, nil, nil, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestEmptyPluginSetPreservesPromptBytes(t *testing.T) {
 	claim := protocol.Claim{
 		Task:       protocol.Task{Title: "Build calculator", Description: "Implement the approved spec."},
@@ -184,13 +192,21 @@ func TestPluginDependencyHealthIsRechecked(t *testing.T) {
 }
 
 func TestBundledDotnetQualityPluginLoads(t *testing.T) {
-	root, err := filepath.Abs(filepath.Join("..", "..", "plugins"))
+	sourceRoot, err := filepath.Abs(filepath.Join("..", "..", "plugins", "dotnet-quality"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	root := t.TempDir()
+	secureTestDirectory(t, root)
+	copyTestDirectory(t, sourceRoot, filepath.Join(root, "dotnet-quality"))
+	artifactRoot := t.TempDir()
+	secureTestDirectory(t, artifactRoot)
+	wantedExecutable := filepath.Join(artifactRoot, "dotnet-quality", "CWM.RoslynNavigator.0.8.0", "tools", "net10.0", "any", "CWM.RoslynNavigator.dll")
+	replaceFile(t, filepath.Join(root, "dotnet-quality", "codex", "agents", "dotnet-quality-reviewer.toml"),
+		"/opt/factory/plugin-artifacts/dotnet-quality/CWM.RoslynNavigator.0.8.0/tools/net10.0/any/CWM.RoslynNavigator.dll", wantedExecutable)
 	plugins, err := loadPlugins(Config{
 		Runtime: "codex", PluginDirectory: root,
-		PluginArtifactDirectory: "/opt/factory/plugin-artifacts", EnabledPlugins: []string{"dotnet-quality"},
+		PluginArtifactDirectory: artifactRoot, EnabledPlugins: []string{"dotnet-quality"},
 	}, func(command string) (string, error) { return "/test/bin/" + command, nil })
 	if err != nil {
 		t.Fatal(err)
@@ -212,14 +228,45 @@ func TestBundledDotnetQualityPluginLoads(t *testing.T) {
 	if got := plugins[0].HealthChecks; len(got) != 1 || got[0].SemanticTool != "find_symbol" {
 		t.Fatalf("bundled plugin semantic health checks = %#v", got)
 	}
+	if got := plugins[0].HealthChecks[0].Command; got != dotnetRunnerPath {
+		t.Fatalf("bundled Roslyn runner = %q, want %q", got, dotnetRunnerPath)
+	}
+	if got := plugins[0].ArtifactRoot; got != artifactRoot {
+		t.Fatalf("canonical artifact root = %q, want %q", got, artifactRoot)
+	}
 	artifact := plugins[0].Artifacts[0]
 	if artifact.Name != "CWM.RoslynNavigator" || artifact.Version != "0.8.0" ||
 		artifact.PackageSHA256 != "18432346439a1f1a1fdc1b82f7f944a4e6f4202347a2cfece7ee75992530cfcd" ||
 		artifact.ExecutableSHA256 != "becde1c2c2b4a478f099d16f5c5dc426365fa4c7d8c0d656fe7e031086b2bb5d" {
 		t.Fatalf("bundled Roslyn artifact pin = %#v", artifact)
 	}
-	if got := plugins[0].HealthChecks[0].Arguments; len(got) != 1 || got[0] != "/opt/factory/plugin-artifacts/dotnet-quality/CWM.RoslynNavigator.0.8.0/tools/net10.0/any/CWM.RoslynNavigator.dll" {
+	if got := plugins[0].HealthChecks[0].Arguments; len(got) != 1 || got[0] != wantedExecutable {
 		t.Fatalf("bundled Roslyn command arguments = %#v", got)
+	}
+}
+
+func copyTestDirectory(t *testing.T, source, target string) {
+	t.Helper()
+	err := filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		destination := filepath.Join(target, relative)
+		if entry.IsDir() {
+			return os.MkdirAll(destination, 0o700)
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(destination, body, 0o600)
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -246,6 +293,7 @@ func TestBundledDotnetQualityPluginRealHealth(t *testing.T) {
 
 func TestPluginActivationRequiresExactInstalledAgentAndSemanticProbe(t *testing.T) {
 	root := t.TempDir()
+	secureTestDirectory(t, root)
 	source := filepath.Join(root, "reviewer.toml")
 	if err := os.WriteFile(source, []byte("reviewed-agent"), 0o600); err != nil {
 		t.Fatal(err)
@@ -295,6 +343,7 @@ func TestPluginActivationRequiresExactInstalledAgentAndSemanticProbe(t *testing.
 
 func TestPluginArtifactRequiresPinnedPackageAndExecutableHashes(t *testing.T) {
 	root := t.TempDir()
+	secureTestDirectory(t, root)
 	pluginRoot := filepath.Join(root, "dotnet-quality")
 	if err := os.Mkdir(pluginRoot, 0o700); err != nil {
 		t.Fatal(err)
@@ -342,14 +391,47 @@ func TestArtifactHealthRejectsShellOrExtraArguments(t *testing.T) {
 	wanted := "/opt/factory/tool.dll"
 	for _, server := range []codexMCPServer{
 		{Command: "sh", Args: []string{wanted}},
-		{Command: "dotnet", Args: []string{wanted, "--extra"}},
+		{Command: "dotnet", Args: []string{wanted}},
+		{Command: dotnetRunnerPath, Args: []string{wanted, "--extra"}},
 	} {
 		if err := validatePinnedArtifactServer(server, wanted); err == nil {
 			t.Fatalf("unsafe server %#v was accepted", server)
 		}
 	}
-	if err := validatePinnedArtifactServer(codexMCPServer{Command: "dotnet", Args: []string{wanted}}, wanted); err != nil {
+	if err := validatePinnedArtifactServer(codexMCPServer{Command: dotnetRunnerPath, Args: []string{wanted}}, wanted); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSecureDirectoryRejectsUserOwnedSymlinkAncestor(t *testing.T) {
+	root := t.TempDir()
+	secureTestDirectory(t, root)
+	real := filepath.Join(root, "real", "artifacts")
+	if err := os.MkdirAll(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linked := filepath.Join(root, "linked")
+	if err := os.Symlink(filepath.Join(root, "real"), linked); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secureDirectory(filepath.Join(linked, "artifacts"), "plugin artifact directory"); err == nil ||
+		!strings.Contains(err.Error(), "symlink component") {
+		t.Fatalf("symlinked artifact ancestor error = %v", err)
+	}
+}
+
+func TestLoadCodexMCPServerRejectsRunnerInjectionEnvironment(t *testing.T) {
+	for _, key := range []string{"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "DOTNET_STARTUP_HOOKS", "DOTNET_ADDITIONAL_DEPS"} {
+		t.Run(key, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "agent.toml")
+			body := fmt.Sprintf("name = \"reviewer\"\ndescription = \"review\"\nmodel_reasoning_effort = \"high\"\nsandbox_mode = \"read-only\"\ndeveloper_instructions = \"review\"\n[mcp_servers.roslyn]\ncommand = %q\nargs = [\"/tool.dll\"]\nenv = {%s = \"unsafe\"}\nstartup_timeout_sec = 1\ntool_timeout_sec = 1\nenabled = true\nrequired = true\n", dotnetRunnerPath, key)
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadCodexMCPServer(path, "roslyn"); err == nil || !strings.Contains(err.Error(), "alter runner loading") {
+				t.Fatalf("unsafe environment error = %v", err)
+			}
+		})
 	}
 }
 
@@ -411,7 +493,9 @@ func TestProbeMCPServerRequiresCleanProtocolAndSemanticCall(t *testing.T) {
 		{name: "stdout log corruption", mode: "polluted", want: "not valid MCP JSON"},
 		{name: "partial stdout", mode: "partial", want: "not valid MCP JSON"},
 		{name: "early exit", mode: "exit", want: "not valid MCP JSON"},
+		{name: "stderr diagnostics", mode: "stderr-exit", want: "diagnostic marker"},
 		{name: "semantic result missing", mode: "missing-result", want: "before startup timeout", timeout: 750 * time.Millisecond},
+		{name: "semantic attempt limit", mode: "missing-result", want: "2 attempts", timeout: 5 * time.Second},
 		{name: "echoed marker not found", mode: "echo-not-found", want: "before startup timeout", timeout: 750 * time.Millisecond},
 		{name: "tool error echoes marker", mode: "tool-error", want: "isError=true"},
 		{name: "malformed structured content", mode: "malformed-result", want: "structured Roslyn result"},
@@ -431,6 +515,12 @@ func TestProbeMCPServerRequiresCleanProtocolAndSemanticCall(t *testing.T) {
 				RequiredTools: []string{"find_symbol"}, SemanticTool: "find_symbol",
 				SemanticArgs:   json.RawMessage(`{"name":"ReviewerHealthMarker"}`),
 				ExpectedResult: "ReviewerHealthMarker",
+				SemanticAttempts: func() int {
+					if test.name == "semantic attempt limit" {
+						return 2
+					}
+					return 0
+				}(),
 			})
 			if test.want == "" && err != nil {
 				t.Fatal(err)
@@ -439,6 +529,33 @@ func TestProbeMCPServerRequiresCleanProtocolAndSemanticCall(t *testing.T) {
 				t.Fatalf("probe error = %v, want containing %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestProbeMCPServerReleasesReaderAfterUnconsumedBurst(t *testing.T) {
+	t.Setenv("FACTORY_MCP_PROBE_HELPER", "1")
+	readerStopped := make(chan struct{})
+	readerBackpressured := make(chan struct{}, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := probeMCPServer(ctx, mcpProbeSpec{
+		Executable: os.Args[0], Arguments: []string{"-test.run=TestMCPProbeHelperProcess", "--", "post-list-burst"},
+		RequiredTools: []string{"missing-tool"}, SemanticTool: "find_symbol",
+		SemanticArgs: json.RawMessage(`{"name":"ReviewerHealthMarker"}`), ExpectedResult: "ReviewerHealthMarker",
+		ReaderStopped: readerStopped, ReaderBackpressured: readerBackpressured,
+	})
+	if err == nil || !strings.Contains(err.Error(), "required tool") {
+		t.Fatalf("probe error = %v", err)
+	}
+	select {
+	case <-readerBackpressured:
+	default:
+		t.Fatal("test did not reproduce MCP response-channel backpressure")
+	}
+	select {
+	case <-readerStopped:
+	case <-time.After(time.Second):
+		t.Fatal("MCP stdout reader did not stop")
 	}
 }
 
@@ -466,6 +583,10 @@ func TestMCPProbeHelperProcess(t *testing.T) {
 		return
 	}
 	mode := os.Args[len(os.Args)-1]
+	if mode == "stderr-exit" {
+		fmt.Fprintln(os.Stderr, "diagnostic marker")
+		return
+	}
 	if mode == "early-child-exit" {
 		command := exec.Command("sleep", "60")
 		if err := command.Start(); err != nil {
@@ -518,6 +639,14 @@ func TestMCPProbeHelperProcess(t *testing.T) {
 				"jsonrpc": "2.0", "id": 2,
 				"result": map[string]interface{}{"tools": []map[string]string{{"name": "find_symbol"}}},
 			})
+			if mode == "post-list-burst" {
+				for index := 0; index < 100; index++ {
+					_ = encoder.Encode(map[string]interface{}{
+						"jsonrpc": "2.0", "method": "notifications/progress",
+						"params": map[string]int{"index": index},
+					})
+				}
+			}
 		case "tools/call":
 			marker := "ReviewerHealthMarker"
 			if mode == "missing-result" {
@@ -626,6 +755,7 @@ func TestManifestRejectsUnsortedPluginEvidence(t *testing.T) {
 
 func writePluginFixture(t *testing.T, root, id, version, prompt, runtime string, commands []string) string {
 	t.Helper()
+	secureTestDirectory(t, root)
 	directory := filepath.Join(root, id)
 	if err := os.Mkdir(directory, 0o700); err != nil {
 		t.Fatal(err)
@@ -663,6 +793,13 @@ license = "MIT"
 		t.Fatal(err)
 	}
 	return directory
+}
+
+func secureTestDirectory(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func appendFile(t *testing.T, path, value string) {
@@ -703,21 +840,36 @@ func testSHA256(body []byte) string {
 func assertProcessStopped(t *testing.T, pid int) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
-	for processRunning(pid) && time.Now().Before(deadline) {
+	for {
+		running, err := processRunning(pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !running || !time.Now().Before(deadline) {
+			break
+		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	if processRunning(pid) {
+	running, err := processRunning(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if running {
 		t.Fatalf("child process %d survived probe cleanup", pid)
 	}
 }
 
-func processRunning(pid int) bool {
+func processRunning(pid int) (bool, error) {
 	output, err := exec.Command("ps", "-o", "stat=", "-p", fmt.Sprintf("%d", pid)).Output()
 	if err != nil {
-		return false
+		var exitError *exec.ExitError
+		if errors.As(err, &exitError) && exitError.ExitCode() == 1 && len(bytes.TrimSpace(output)) == 0 {
+			return false, nil
+		}
+		return false, fmt.Errorf("inspect child process %d: %w", pid, err)
 	}
 	state := strings.TrimSpace(string(output))
-	return state != "" && !strings.HasPrefix(state, "Z")
+	return state != "" && !strings.HasPrefix(state, "Z"), nil
 }
 
 func testZip(t *testing.T, files map[string][]byte) []byte {

@@ -31,6 +31,14 @@ func validatePathOwner(info os.FileInfo, name string) error {
 	return nil
 }
 
+func fileOwnerID(info os.FileInfo) (int, bool) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return int(stat.Uid), true
+}
+
 func ShutdownSignals() []os.Signal {
 	return []os.Signal{os.Interrupt, syscall.SIGTERM}
 }
@@ -130,6 +138,9 @@ func stopLeaderlessProcessGroup(processGroupID int, grace time.Duration) error {
 		if !processGroupAlive(processGroupID) {
 			return nil
 		}
+	}
+	if !processGroupAlive(processGroupID) {
+		return nil
 	}
 	return signalProcessGroup(processGroupID, unix.SIGKILL)
 }

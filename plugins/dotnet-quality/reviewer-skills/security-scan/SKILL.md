@@ -61,7 +61,7 @@ reference. Do not delegate to agents or skills outside this reviewer bundle.
 | # | Layer | OWASP 2025 | Method |
 |---|-------|-----------|--------|
 | 1 | Package vulnerabilities | A03 Supply Chain | `dotnet list package --vulnerable --include-transitive` |
-| 2 | Secrets detection | — | Pattern scan over .cs/.json/.yml/.xml/.config |
+| 2 | Secrets detection | — | Pattern scan over tracked .cs/.json/.yml/.yaml/.toml/.env/.xml/.config/.props/.targets and .csproj/.fsproj/.vbproj files |
 | 3 | OWASP code patterns | A05 Injection, A08 Integrity, A04 Crypto, A01 Access Control | Source scan: raw SQL, `Html.Raw`, `BinaryFormatter`, MD5/SHA1, IDOR |
 | 4 | Auth configuration | A07 Authentication, A01 Access Control | `get_endpoint_map` — every route's auth posture in one call; flag `unmarked` endpoints; then JWT validation settings |
 | 5 | CORS policy | A02 Misconfiguration | Wildcard origins, credentials combos, method/header breadth |
@@ -72,8 +72,9 @@ reference. Do not delegate to agents or skills outside this reviewer bundle.
 Severity must match actual risk — over-classification causes alert fatigue and
 buries the real Critical:
 
-- Test-fixture "secrets" and appsettings.Development.json values are expected —
-  skip or mark INFO, don't flag as HIGH
+- Exclude only documented placeholders and generated fake values. A tracked
+  non-placeholder credential is reportable even when it appears in a test
+  fixture or development configuration.
 - A missing XML comment is never a security finding
 - Reserve Critical for exploitable-now issues: injection on public endpoints,
   exposed production secrets, auth bypass
@@ -87,7 +88,7 @@ static-analysis disclaimer.
 
 ## Example
 
-```
+```text
 User: /security-scan before we ship
 
 Claude: Running all 6 layers...
@@ -95,7 +96,7 @@ Claude: Running all 6 layers...
 | Layer | Status | Findings |
 |-------|--------|----------|
 | 1. Packages | PASS | 0 CVEs (142 packages incl. transitive) |
-| 2. Secrets | PASS | 0 real secrets (2 dev-only values skipped) |
+| 2. Secrets | PASS | 0 real secrets (2 documented placeholders excluded) |
 | 3. OWASP Patterns | FAIL | 1 SQL injection |
 | 4. Auth Config | WARN | 2 endpoints missing explicit auth attributes |
 | 5. CORS | PASS | Explicit origins from configuration |

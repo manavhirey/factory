@@ -16,7 +16,10 @@ description: >
 
 1. **Use the newest stable features** — C# 14 is the target. Prefer language-level constructs over library workarounds.
 2. **Readability over cleverness** — Pattern matching and expression-bodied members improve readability when used appropriately; deeply nested patterns do not.
-3. **Value types where possible** — Prefer `record struct`, `Span<T>`, and stack allocation to reduce GC pressure.
+3. **Value types where appropriate** — Prefer small `readonly record struct`
+   values and `Span<T>` when measurement supports them. Value types may still
+   be boxed or embedded in heap objects; `record struct` does not guarantee
+   stack allocation.
 4. **Immutability by default** — Use `record`, `readonly`, `init`, and `required` to make illegal states unrepresentable.
 
 ## Patterns
@@ -28,10 +31,10 @@ description: >
 | Primary constructors | DI injection, eliminate field assignments | `public class OrderService(IOrderRepo repo, TimeProvider clock) { }` |
 | Collection expressions | `[]` for all collection types + spread | `List<string> names = ["Alice", "Bob"];` / `int[] all = [..a, ..b, 99];` |
 | Records | DTOs, value objects, immutable data | `public record CreateOrderRequest(string CustomerId, List<OrderItem> Items);` |
-| `readonly record struct` | Small stack-allocated value types | `public readonly record struct Money(decimal Amount, string Currency);` |
+| `readonly record struct` | Small immutable value types where copy cost and boxing are understood | `public readonly record struct Money(decimal Amount, string Currency);` |
 | Pattern matching | Switch expressions, list/property patterns | `order switch { { Total: > 1000 } => "Premium", _ => "Standard" };` |
 | List patterns | Deconstruct arrays/lists | `items switch { [] => "Empty", [var x] => $"One: {x}", [var f, .., var l] => $"{f}..{l}" };` |
-| `Span<T>` | Zero-allocation slicing | `ReadOnlySpan<char> trimmed = input.Trim(); int.TryParse(trimmed[4..], out id);` |
+| `Span<T>` | Allocation-free slicing over existing storage | `ReadOnlySpan<char> trimmed = input.AsSpan().Trim(); int.TryParse(trimmed[4..], out id);` |
 | Raw string literals | Multi-line SQL, JSON, XML | `var sql = """ SELECT ... """;` / interpolated: `$$""" {"id": "{{id}}"} """;` |
 | `required` members | Enforce initialization | `public required string ConnectionString { get; init; }` |
 | `is` pattern + extraction | Null/type/property check | `if (result is { IsSuccess: true, Value: var order }) { ... }` |
@@ -48,7 +51,7 @@ public class Product
     {
         get => field;
         set => field = value?.Trim() ?? throw new ArgumentNullException(nameof(value));
-    }
+    } = string.Empty;
 
     public decimal Price
     {

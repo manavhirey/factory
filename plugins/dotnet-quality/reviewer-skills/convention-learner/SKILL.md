@@ -25,7 +25,7 @@ description: >
 Systematic analysis to understand a project's coding conventions. Run this when joining an existing project or before generating new code.
 
 **Step 1: Project Structure Analysis**
-```
+```text
 → get_project_graph
   Detect:
   - Project naming: PascalCase? Dots? (MyApp.Domain vs Domain)
@@ -35,7 +35,7 @@ Systematic analysis to understand a project's coding conventions. Run this when 
 ```
 
 **Step 2: Type Naming Patterns**
-```
+```text
 → get_public_api (on 3-5 key types across different layers)
   Detect:
   - Class modifiers: sealed? internal? internal sealed?
@@ -55,7 +55,7 @@ Scan the file system for structural conventions:
 **Step 4: Configuration Detection**
 Check for explicit convention enforcers:
 
-```
+```text
 → Look for Directory.Build.props
   - TreatWarningsAsErrors?
   - Nullable enabled globally?
@@ -121,7 +121,7 @@ public record ProductResponse(Guid Id, string Name, decimal Price);
 **When Reviewing Code:**
 Flag deviations from detected conventions:
 
-```
+```text
 ⚠️ Convention violation: CreateOrderHandler is `public class` but project convention
    is `internal sealed class` (detected in 12/12 existing handlers).
    Change to: internal sealed class CreateOrderHandler
@@ -143,7 +143,7 @@ csharp_style_prefer_primary_constructors = true:suggestion
 Use `detect_antipatterns` to track recurring quality issues across sessions.
 
 **Periodic Check:**
-```
+```text
 → detect_antipatterns (scope: solution)
   Track over time:
   - Are the same patterns recurring? (DateTime.Now keeps appearing)
@@ -152,7 +152,7 @@ Use `detect_antipatterns` to track recurring quality issues across sessions.
 ```
 
 **Prioritization:**
-```
+```markdown
 | Anti-pattern | Count | Trend | Priority |
 |-------------|-------|-------|----------|
 | DateTime.Now | 12 | ↑ +3 | High — add to CLAUDE.md conventions |
@@ -170,13 +170,13 @@ When patterns recur, add explicit rules to CLAUDE.md:
 
 ### Enforcing Without Detecting
 
-```
+```text
 # BAD — Imposing kit defaults on a project with its own conventions
 "All handlers should be internal sealed class"
 # But this project uses public class with interfaces for testing
 ```
 
-```
+```text
 # GOOD — Detect first, then follow what exists
 → get_public_api reveals: 8/8 handlers are `public class` implementing `IHandler<T>`
 "This project uses public handlers with interfaces. Matching that convention."
@@ -184,13 +184,13 @@ When patterns recur, add explicit rules to CLAUDE.md:
 
 ### Overriding Explicit Project Rules
 
-```
+```text
 # BAD — Ignoring .editorconfig because kit says otherwise
 # .editorconfig says: csharp_style_expression_bodied_methods = false
 # But generating expression-bodied methods anyway
 ```
 
-```
+```text
 # GOOD — .editorconfig and Directory.Build.props always win
 "Your .editorconfig disables expression-bodied methods.
 I'll use block-bodied methods to match your project settings."
@@ -198,13 +198,13 @@ I'll use block-bodied methods to match your project settings."
 
 ### Applying Generic Conventions to Unconventional Projects
 
-```
+```text
 # BAD — Forcing Clean Architecture naming on a VSA project
 "You need a Services/ folder and a Repositories/ folder"
 # But this project uses feature folders with everything co-located
 ```
 
-```
+```text
 # GOOD — Match the project's organizational convention
 "This project uses feature folders. I'll add the new feature
 at Features/Shipping/ with all related files together."
@@ -212,12 +212,12 @@ at Features/Shipping/ with all related files together."
 
 ### Documenting Conventions Without Evidence
 
-```
+```text
 # BAD — "Conventions" based on reading one file
 "Convention: Use var everywhere" (based on seeing var in one method)
 ```
 
-```
+```text
 # GOOD — Document only patterns confirmed across multiple files
 → get_public_api on 5 types: 100% use explicit types for non-obvious cases
 "Convention: Use explicit types for non-obvious cases (e.g., method returns),

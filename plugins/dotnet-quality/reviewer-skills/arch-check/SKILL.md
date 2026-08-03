@@ -38,18 +38,24 @@ fix — or a clean conformance pass.
 
 In order of authority: the project's CLAUDE.md, an ADR in `docs/decisions/`,
 or ask the user. Never infer silently — a wrong baseline produces a wrong
-report. The four supported baselines and their rules:
+report. For Clean Architecture, derive permitted project-reference arrows and
+composition-root wiring exceptions from the solution graph, project files,
+architecture tests, and declared project documentation before classifying a
+reference. Do not impose a universal graph: for example, a project may
+explicitly permit Infrastructure → Domain, and an API composition root may
+reference both Application and Infrastructure for dependency registration.
+The four supported baselines and their rules:
 
 | Architecture | Rules checked |
 |---|---|
 | Vertical Slice | Features don't reference sibling features; shared code only via explicitly shared folders/projects |
-| Clean Architecture | Domain → nothing; Application → Domain only; Infrastructure → Application; Api → Application (never Api → Infrastructure types, wiring only) |
+| Clean Architecture | Enforce the project's declared inward dependency graph; Domain normally has no outward layer dependency, while Infrastructure and the composition root may reference declared inner layers or wiring projects |
 | DDD + Clean | Clean rules + aggregates referenced only via roots; domain events for cross-aggregate effects |
 | Modular Monolith | No project references between modules except `*.Contracts`; cross-module calls via integration events or contracts |
 
 **Step 2: Project-level dependency direction (cheapest, catches most)**
 
-```
+```text
 get_project_graph()
 ```
 
@@ -59,7 +65,7 @@ makes every downstream violation possible.
 
 **Step 3: Cycles**
 
-```
+```text
 detect_circular_dependencies()
 ```
 
@@ -69,7 +75,7 @@ Cycles are violations in every baseline. Report the full chain.
 
 Project references can be clean while code still leaks. Probe the risky edges:
 
-```
+```text
 get_dependency_graph(symbolName: <a Domain entity>, depth: 2)
    -- Domain types pulling in EF Core, HttpClient, or Infrastructure namespaces?
 find_references(symbolName: <a module-internal type>)
@@ -84,7 +90,7 @@ types inside two or three feature folders.
 
 **Step 5: Presentation boundary**
 
-```
+```text
 get_endpoint_map()
 ```
 
@@ -116,7 +122,7 @@ an integration event). Offer to fix CRITICAL items immediately.
 
 ## Example
 
-```
+```text
 User: /arch-check
 
 Claude: Baseline from CLAUDE.md: Clean Architecture (4 projects).
