@@ -1318,7 +1318,7 @@ func sanitizedMCPEnvironment(environment []string) []string {
 }
 
 func forbiddenMCPEnvironmentKey(key string) bool {
-	return key == "LD_PRELOAD" || key == "LD_LIBRARY_PATH" || strings.HasPrefix(key, "DYLD_") ||
+	return strings.HasPrefix(key, "LD_") || strings.HasPrefix(key, "DYLD_") ||
 		key == "DOTNET_STARTUP_HOOKS" || key == "DOTNET_ADDITIONAL_DEPS" || key == "DOTNET_ROOT" ||
 		strings.HasPrefix(key, "DOTNET_ROOT_") || key == "DOTNET_HOST_PATH" || key == "DOTNET_ENABLE_PROFILING" ||
 		key == "DOTNET_PROFILER" || strings.HasPrefix(key, "DOTNET_PROFILER_PATH") ||

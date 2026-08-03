@@ -421,7 +421,7 @@ func TestSecureDirectoryRejectsUserOwnedSymlinkAncestor(t *testing.T) {
 }
 
 func TestLoadCodexMCPServerRejectsRunnerInjectionEnvironment(t *testing.T) {
-	for _, key := range []string{"LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "DOTNET_STARTUP_HOOKS", "DOTNET_ADDITIONAL_DEPS", "DOTNET_ROOT", "DOTNET_ROOT_X64", "DOTNET_HOST_PATH", "DOTNET_ENABLE_PROFILING", "DOTNET_PROFILER", "DOTNET_PROFILER_PATH_64", "CORECLR_PROFILER_PATH", "COMPlus_ReadyToRun"} {
+	for _, key := range []string{"LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_FUTURE_LOADER_FLAG", "DYLD_INSERT_LIBRARIES", "DOTNET_STARTUP_HOOKS", "DOTNET_ADDITIONAL_DEPS", "DOTNET_ROOT", "DOTNET_ROOT_X64", "DOTNET_HOST_PATH", "DOTNET_ENABLE_PROFILING", "DOTNET_PROFILER", "DOTNET_PROFILER_PATH_64", "CORECLR_PROFILER_PATH", "COMPlus_ReadyToRun"} {
 		t.Run(key, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "agent.toml")
 			body := fmt.Sprintf("name = \"reviewer\"\ndescription = \"review\"\nmodel_reasoning_effort = \"high\"\nsandbox_mode = \"read-only\"\ndeveloper_instructions = \"review\"\n[mcp_servers.roslyn]\ncommand = %q\nargs = [\"/tool.dll\"]\nenv = {%s = \"unsafe\"}\nstartup_timeout_sec = 1\ntool_timeout_sec = 1\nenabled = true\nrequired = true\n", dotnetRunnerPath, key)
@@ -505,7 +505,7 @@ func TestProbeMCPServerRequiresCleanProtocolAndSemanticCall(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if test.mode == "reject-loader-env" {
-				for _, key := range []string{"LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "DOTNET_STARTUP_HOOKS", "DOTNET_ADDITIONAL_DEPS", "DOTNET_ROOT", "DOTNET_ROOT_X64", "DOTNET_HOST_PATH", "DOTNET_ENABLE_PROFILING", "DOTNET_PROFILER", "DOTNET_PROFILER_PATH_64", "CORECLR_PROFILER_PATH", "COMPlus_ReadyToRun"} {
+				for _, key := range []string{"LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_FUTURE_LOADER_FLAG", "DYLD_INSERT_LIBRARIES", "DOTNET_STARTUP_HOOKS", "DOTNET_ADDITIONAL_DEPS", "DOTNET_ROOT", "DOTNET_ROOT_X64", "DOTNET_HOST_PATH", "DOTNET_ENABLE_PROFILING", "DOTNET_PROFILER", "DOTNET_PROFILER_PATH_64", "CORECLR_PROFILER_PATH", "COMPlus_ReadyToRun"} {
 					t.Setenv(key, "/unreviewed/injection")
 				}
 			}
@@ -590,7 +590,7 @@ func TestMCPProbeHelperProcess(t *testing.T) {
 	}
 	mode := os.Args[len(os.Args)-1]
 	if mode == "reject-loader-env" {
-		for _, key := range []string{"LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "DOTNET_STARTUP_HOOKS", "DOTNET_ADDITIONAL_DEPS", "DOTNET_ROOT", "DOTNET_ROOT_X64", "DOTNET_HOST_PATH", "DOTNET_ENABLE_PROFILING", "DOTNET_PROFILER", "DOTNET_PROFILER_PATH_64", "CORECLR_PROFILER_PATH", "COMPlus_ReadyToRun"} {
+		for _, key := range []string{"LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_FUTURE_LOADER_FLAG", "DYLD_INSERT_LIBRARIES", "DOTNET_STARTUP_HOOKS", "DOTNET_ADDITIONAL_DEPS", "DOTNET_ROOT", "DOTNET_ROOT_X64", "DOTNET_HOST_PATH", "DOTNET_ENABLE_PROFILING", "DOTNET_PROFILER", "DOTNET_PROFILER_PATH_64", "CORECLR_PROFILER_PATH", "COMPlus_ReadyToRun"} {
 			if os.Getenv(key) != "" {
 				os.Exit(9)
 			}
