@@ -12,10 +12,12 @@ Remediate with a patched version or document compensating controls.
 
 ## Layer 2: Secrets detection
 
-Inspect C#, JSON, YAML, XML, and configuration files for private keys, bearer
-tokens, cloud keys, connection-string passwords, and literal values assigned
-to API-key/secret/token variables. Exclude obvious placeholders, fake test
-fixtures, development-only values, and `UserSecretsId` declarations.
+Inspect tracked C#, JSON, YAML, TOML, `.env`, XML, `.config`, MSBuild
+`.props`/`.targets`, and project files for private keys, bearer tokens, cloud
+keys, connection-string passwords, and literal values assigned to
+API-key/secret/token variables. Exclude only documented placeholders,
+generated fake values, and non-secret `UserSecretsId` identifiers. Report any
+tracked non-placeholder credential regardless of a test or development path.
 
 ## Layer 3: OWASP code patterns
 

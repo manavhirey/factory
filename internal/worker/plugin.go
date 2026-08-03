@@ -23,8 +23,11 @@ import (
 )
 
 const (
-	pluginSchemaVersion  = 1
-	maxPluginPromptBytes = 32 << 10
+	pluginSchemaVersion      = 1
+	maxPluginPromptBytes     = 32 << 10
+	dotnetRunnerPath         = "/usr/bin/dotnet"
+	maxSemanticProbeAttempts = 100
+	maxMCPStderrBytes        = 4 << 10
 )
 
 var (
@@ -146,15 +149,18 @@ type commandLookup func(string) (string, error)
 type mcpProbe func(context.Context, mcpProbeSpec) error
 
 type mcpProbeSpec struct {
-	Executable       string
-	Arguments        []string
-	Environment      map[string]string
-	WorkingDir       string
-	RequiredTools    []string
-	SemanticTool     string
-	SemanticArgs     json.RawMessage
-	ExpectedResult   string
-	StopProcessGroup func(int, string, time.Duration) error
+	Executable          string
+	Arguments           []string
+	Environment         map[string]string
+	WorkingDir          string
+	RequiredTools       []string
+	SemanticTool        string
+	SemanticArgs        json.RawMessage
+	ExpectedResult      string
+	SemanticAttempts    int
+	StopProcessGroup    func(int, string, time.Duration) error
+	ReaderStopped       chan struct{}
+	ReaderBackpressured chan struct{}
 }
 
 func (plugin Plugin) Identity() string {
@@ -193,13 +199,13 @@ func checkPluginActivation(ctx context.Context, plugins []Plugin, lookup command
 	if probe == nil {
 		probe = probeMCPServer
 	}
-	userHome, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("resolve home for plugin context isolation: %w", err)
-	}
 	if codexHome == "" {
 		codexHome = os.Getenv("CODEX_HOME")
 		if codexHome == "" {
+			userHome, err := os.UserHomeDir()
+			if err != nil {
+				return fmt.Errorf("resolve home for plugin context isolation: %w", err)
+			}
 			codexHome = filepath.Join(userHome, ".codex")
 		}
 	}
@@ -216,19 +222,8 @@ func checkPluginActivation(ctx context.Context, plugins []Plugin, lookup command
 		}
 		for _, asset := range plugin.ContextAssets {
 			installed := filepath.Join(codexHome, strings.TrimPrefix(asset.RelativePath, "codex/"))
-			if err := secureRegularFile(codexHome, installed, "installed plugin context"); err != nil {
-				return fmt.Errorf("plugin %q context %q is not installed: %w", plugin.ID, asset.RelativePath, err)
-			}
-			source, err := os.ReadFile(asset.SourcePath)
-			if err != nil {
-				return fmt.Errorf("read plugin %q context %q: %w", plugin.ID, asset.RelativePath, err)
-			}
-			body, err := os.ReadFile(installed)
-			if err != nil {
-				return fmt.Errorf("read installed plugin %q context %q: %w", plugin.ID, asset.RelativePath, err)
-			}
-			if !bytes.Equal(source, body) {
-				return fmt.Errorf("plugin %q context %q does not match the reviewed plugin asset", plugin.ID, asset.RelativePath)
+			if err := verifyInstalledAsset(codexHome, installed, plugin.ID, asset, "context", "installed plugin context"); err != nil {
+				return err
 			}
 		}
 		if err := verifyInstalledReviewerAssetClosure(codexHome, plugin); err != nil {
@@ -237,25 +232,17 @@ func checkPluginActivation(ctx context.Context, plugins []Plugin, lookup command
 		for _, asset := range plugin.ReviewerAssets {
 			installed := filepath.Join(codexHome, "reviewer-skills", plugin.ID,
 				strings.TrimPrefix(asset.RelativePath, "reviewer-skills/"))
-			if err := secureRegularFile(codexHome, installed, "installed reviewer instruction"); err != nil {
-				return fmt.Errorf("plugin %q reviewer instruction %q is not installed: %w", plugin.ID, asset.RelativePath, err)
-			}
-			source, err := os.ReadFile(asset.SourcePath)
-			if err != nil {
-				return fmt.Errorf("read plugin %q reviewer instruction %q: %w", plugin.ID, asset.RelativePath, err)
-			}
-			body, err := os.ReadFile(installed)
-			if err != nil {
-				return fmt.Errorf("read installed plugin %q reviewer instruction %q: %w", plugin.ID, asset.RelativePath, err)
-			}
-			if !bytes.Equal(source, body) {
-				return fmt.Errorf("plugin %q reviewer instruction %q does not match the reviewed plugin asset", plugin.ID, asset.RelativePath)
+			if err := verifyInstalledAsset(codexHome, installed, plugin.ID, asset, "reviewer instruction", "installed reviewer instruction"); err != nil {
+				return err
 			}
 		}
 		for _, healthCheck := range plugin.HealthChecks {
 			executable, err := lookup(healthCheck.Command)
 			if err != nil {
 				return fmt.Errorf("plugin %q health check command %q is unavailable", plugin.ID, healthCheck.Command)
+			}
+			if filepath.IsAbs(healthCheck.Command) && filepath.Clean(executable) != filepath.Clean(healthCheck.Command) {
+				return fmt.Errorf("plugin %q health check command %q resolved to unexpected path %q", plugin.ID, healthCheck.Command, executable)
 			}
 			probeContext, cancel := context.WithTimeout(ctx, time.Duration(healthCheck.StartupTimeout)*time.Second)
 			err = probe(probeContext, mcpProbeSpec{
@@ -269,6 +256,24 @@ func checkPluginActivation(ctx context.Context, plugins []Plugin, lookup command
 				return fmt.Errorf("plugin %q MCP server %q failed its protocol health check: %w", plugin.ID, healthCheck.MCPServer, err)
 			}
 		}
+	}
+	return nil
+}
+
+func verifyInstalledAsset(codexHome, installed, pluginID string, asset PluginContextAsset, kind, secureName string) error {
+	if err := secureRegularFile(codexHome, installed, secureName); err != nil {
+		return fmt.Errorf("plugin %q %s %q is not installed: %w", pluginID, kind, asset.RelativePath, err)
+	}
+	source, err := os.ReadFile(asset.SourcePath)
+	if err != nil {
+		return fmt.Errorf("read plugin %q %s %q: %w", pluginID, kind, asset.RelativePath, err)
+	}
+	body, err := os.ReadFile(installed)
+	if err != nil {
+		return fmt.Errorf("read installed plugin %q %s %q: %w", pluginID, kind, asset.RelativePath, err)
+	}
+	if !bytes.Equal(source, body) {
+		return fmt.Errorf("plugin %q %s %q does not match the reviewed plugin asset", pluginID, kind, asset.RelativePath)
 	}
 	return nil
 }
@@ -413,6 +418,12 @@ func loadPlugin(root, artifactRoot, enabledID, runtime string, lookup commandLoo
 	if artifactRoot != "" && !filepath.IsAbs(artifactRoot) {
 		return Plugin{}, errors.New("plugin_artifact_directory must be an absolute path")
 	}
+	if artifactRoot != "" {
+		artifactRoot, err = secureDirectory(artifactRoot, "plugin artifact directory")
+		if err != nil {
+			return Plugin{}, err
+		}
+	}
 	healthChecks := make([]PluginHealthCheck, 0, len(manifest.HealthChecks))
 	for _, healthCheck := range manifest.HealthChecks {
 		contextPath := contextPaths[healthCheck.ContextFile]
@@ -420,7 +431,7 @@ func loadPlugin(root, artifactRoot, enabledID, runtime string, lookup commandLoo
 		if err != nil {
 			return Plugin{}, fmt.Errorf("plugin %q health check for %q: %w", enabledID, healthCheck.MCPServer, err)
 		}
-		if !contains(manifest.RequiredCommands, server.Command) {
+		if !contains(manifest.RequiredCommands, filepath.Base(server.Command)) {
 			return Plugin{}, fmt.Errorf("plugin %q health check command %q must be declared in required_commands", enabledID, server.Command)
 		}
 		artifact, found := findPluginArtifact(manifest.Artifacts, healthCheck.Artifact)
@@ -565,9 +576,9 @@ func validatePluginManifest(manifest pluginManifest, enabledID, runtime string) 
 	}
 	seenArtifacts := make(map[string]bool, len(manifest.Artifacts))
 	for index, artifact := range manifest.Artifacts {
-		if !pluginAssetPattern.MatchString(artifact.Kind) || !pluginAssetPattern.MatchString(artifact.Name) ||
+		if !pluginAssetPattern.MatchString(artifact.Name) ||
 			strings.TrimSpace(artifact.Version) == "" || len(artifact.Version) > 100 {
-			return fmt.Errorf("artifact %d has invalid kind, name, or version", index+1)
+			return fmt.Errorf("artifact %d has invalid name or version", index+1)
 		}
 		if err := validateHTTPSURL(artifact.Source, fmt.Sprintf("artifact %d source", index+1)); err != nil {
 			return err
@@ -630,8 +641,10 @@ func loadCodexMCPServer(path, serverName string) (codexMCPServer, error) {
 	if !found {
 		return codexMCPServer{}, fmt.Errorf("Codex agent context does not register MCP server %q", serverName)
 	}
-	if !pluginCommandPattern.MatchString(server.Command) || !server.Enabled || !server.Required {
-		return codexMCPServer{}, errors.New("MCP server must use a command basename and be enabled and required")
+	commandValid := pluginCommandPattern.MatchString(server.Command) ||
+		(filepath.IsAbs(server.Command) && filepath.Clean(server.Command) == server.Command && !strings.ContainsRune(server.Command, '\x00'))
+	if !commandValid || !server.Enabled || !server.Required {
+		return codexMCPServer{}, errors.New("MCP server must use a command basename or clean absolute path and be enabled and required")
 	}
 	if server.StartupTimeoutSec < 1 || server.StartupTimeoutSec > 60 {
 		return codexMCPServer{}, errors.New("MCP server startup_timeout_sec must be between 1 and 60")
@@ -647,6 +660,9 @@ func loadCodexMCPServer(path, serverName string) (codexMCPServer, error) {
 	for key, value := range server.Env {
 		if strings.TrimSpace(key) == "" || strings.Contains(key, "=") || strings.ContainsRune(value, '\x00') {
 			return codexMCPServer{}, errors.New("MCP server env contains an invalid entry")
+		}
+		if forbiddenMCPEnvironmentKey(key) {
+			return codexMCPServer{}, fmt.Errorf("MCP server env %q may not alter runner loading", key)
 		}
 	}
 	return server, nil
@@ -671,8 +687,8 @@ func findPluginArtifact(artifacts []PluginArtifact, name string) (PluginArtifact
 }
 
 func validatePinnedArtifactServer(server codexMCPServer, executablePath string) error {
-	if server.Command != "dotnet" {
-		return errors.New("artifact health requires the dotnet runner; shells and other interpreters are forbidden")
+	if server.Command != dotnetRunnerPath {
+		return fmt.Errorf("artifact health requires the pinned dotnet runner %q; shells, PATH lookup, and other interpreters are forbidden", dotnetRunnerPath)
 	}
 	if len(server.Args) != 1 || server.Args[0] != executablePath {
 		return fmt.Errorf("args must contain only the pinned artifact executable %q", executablePath)
@@ -827,7 +843,7 @@ func verifyFileSHA256(root, path, expected, name string) error {
 	}
 	actual := fmt.Sprintf("%x", digest)
 	if actual != expected {
-		return fmt.Errorf("SHA-256 is %s, want %s", actual, expected)
+		return fmt.Errorf("%s SHA-256 is %s, want %s", name, actual, expected)
 	}
 	return nil
 }
@@ -835,7 +851,7 @@ func verifyFileSHA256(root, path, expected, name string) error {
 func probeMCPServer(ctx context.Context, spec mcpProbeSpec) (returnErr error) {
 	command := exec.Command(spec.Executable, spec.Arguments...)
 	command.Dir = spec.WorkingDir
-	command.Env = append(os.Environ(), sortedEnvironment(spec.Environment)...)
+	command.Env = append(sanitizedMCPEnvironment(os.Environ()), sortedEnvironment(spec.Environment)...)
 	configureNewProcessGroup(command)
 	stdin, err := command.StdinPipe()
 	if err != nil {
@@ -845,7 +861,8 @@ func probeMCPServer(ctx context.Context, spec mcpProbeSpec) (returnErr error) {
 	if err != nil {
 		return fmt.Errorf("open stdout: %w", err)
 	}
-	command.Stderr = io.Discard
+	stderr := &tailBuffer{limit: maxMCPStderrBytes}
+	command.Stderr = stderr
 	if err := command.Start(); err != nil {
 		return fmt.Errorf("start server: %w", err)
 	}
@@ -878,20 +895,46 @@ func probeMCPServer(ctx context.Context, spec mcpProbeSpec) (returnErr error) {
 				returnErr = errors.Join(returnErr, cleanupErr)
 			}
 		}
+		if returnErr != nil && strings.TrimSpace(stderr.String()) != "" {
+			returnErr = fmt.Errorf("%w: MCP server stderr: %s", returnErr, strings.TrimSpace(stderr.String()))
+		}
 	}()
 
 	encoder := json.NewEncoder(stdin)
 	responses := make(chan mcpProbeResponse, 1)
 	decodeErrors := make(chan error, 1)
+	readerDone := make(chan struct{})
+	defer close(readerDone)
 	go func() {
+		if spec.ReaderStopped != nil {
+			defer close(spec.ReaderStopped)
+		}
 		decoder := json.NewDecoder(bufio.NewReader(stdout))
 		for {
 			var response mcpProbeResponse
 			if err := decoder.Decode(&response); err != nil {
-				decodeErrors <- err
+				select {
+				case decodeErrors <- err:
+				case <-readerDone:
+				}
 				return
 			}
-			responses <- response
+			select {
+			case responses <- response:
+				continue
+			default:
+				if spec.ReaderBackpressured != nil {
+					select {
+					case spec.ReaderBackpressured <- struct{}{}:
+					default:
+					}
+				}
+			}
+			select {
+			case responses <- response:
+			case <-readerDone:
+				return
+			}
 		}
 	}()
 
@@ -951,7 +994,11 @@ func probeMCPServer(ctx context.Context, spec mcpProbeSpec) (returnErr error) {
 	if err := json.Unmarshal(spec.SemanticArgs, &semanticArguments); err != nil {
 		return fmt.Errorf("decode semantic probe arguments: %w", err)
 	}
-	for requestID := 3; ; requestID++ {
+	semanticAttempts := spec.SemanticAttempts
+	if semanticAttempts <= 0 {
+		semanticAttempts = maxSemanticProbeAttempts
+	}
+	for requestID := 3; requestID < 3+semanticAttempts; requestID++ {
 		if err := encoder.Encode(map[string]any{
 			"jsonrpc": "2.0", "id": requestID, "method": "tools/call",
 			"params": map[string]any{"name": spec.SemanticTool, "arguments": semanticArguments},
@@ -980,6 +1027,7 @@ func probeMCPServer(ctx context.Context, spec mcpProbeSpec) (returnErr error) {
 		case <-timer.C:
 		}
 	}
+	return fmt.Errorf("semantic tool %q did not return the expected marker before startup timeout or attempt limit (%d attempts)", spec.SemanticTool, semanticAttempts)
 }
 
 func stopCapturedProcessGroup(pid int, identity string, grace time.Duration) error {
@@ -1127,10 +1175,10 @@ func resolvePluginFile(directory, relative string) (string, error) {
 	}
 	real, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		return "", fmt.Errorf("resolve prompt_file: %w", err)
+		return "", fmt.Errorf("resolve plugin file %q: %w", relative, err)
 	}
 	if !pathWithin(directory, real) {
-		return "", errors.New("prompt_file resolves outside the plugin directory")
+		return "", fmt.Errorf("plugin file %q resolves outside the plugin directory", relative)
 	}
 	return real, nil
 }
@@ -1143,7 +1191,48 @@ func resolvePluginDirectory(root, relative string) (string, error) {
 }
 
 func secureDirectory(path, name string) (string, error) {
+	if err := validateSecureDirectoryComponents(path, name); err != nil {
+		return "", err
+	}
 	return realDirectory(path, name)
+}
+
+func validateSecureDirectoryComponents(path, name string) error {
+	clean := filepath.Clean(path)
+	if !filepath.IsAbs(clean) {
+		return fmt.Errorf("%s must be an absolute path", name)
+	}
+	volume := filepath.VolumeName(clean)
+	current := volume + string(filepath.Separator)
+	relative := strings.TrimPrefix(strings.TrimPrefix(clean, volume), string(filepath.Separator))
+	for _, component := range strings.Split(relative, string(filepath.Separator)) {
+		if component == "" {
+			continue
+		}
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return fmt.Errorf("inspect %s: %w", name, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			owner, ok := fileOwnerID(info)
+			if !ok || owner != 0 || os.Geteuid() == 0 {
+				return fmt.Errorf("%s contains symlink component %q", name, current)
+			}
+			continue
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("%s component %q must be a directory", name, current)
+		}
+		owner, ok := fileOwnerID(info)
+		if !ok || (owner != 0 && owner != os.Geteuid()) {
+			return fmt.Errorf("%s component %q has an untrusted owner", name, current)
+		}
+		if info.Mode().Perm()&0o022 != 0 && (owner != 0 || info.Mode()&os.ModeSticky == 0) {
+			return fmt.Errorf("%s component %q must not be group- or world-writable", name, current)
+		}
+	}
+	return nil
 }
 
 func resolveSecureDirectory(root, path, name string) (string, error) {
@@ -1214,6 +1303,26 @@ func sortedEnvironment(environment map[string]string) []string {
 		values = append(values, key+"="+environment[key])
 	}
 	return values
+}
+
+func sanitizedMCPEnvironment(environment []string) []string {
+	sanitized := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		key, _, found := strings.Cut(entry, "=")
+		if found && forbiddenMCPEnvironmentKey(key) {
+			continue
+		}
+		sanitized = append(sanitized, entry)
+	}
+	return sanitized
+}
+
+func forbiddenMCPEnvironmentKey(key string) bool {
+	return strings.HasPrefix(key, "LD_") || strings.HasPrefix(key, "DYLD_") ||
+		key == "DOTNET_STARTUP_HOOKS" || key == "DOTNET_ADDITIONAL_DEPS" || key == "DOTNET_ROOT" ||
+		strings.HasPrefix(key, "DOTNET_ROOT_") || key == "DOTNET_HOST_PATH" || key == "DOTNET_ENABLE_PROFILING" ||
+		key == "DOTNET_PROFILER" || strings.HasPrefix(key, "DOTNET_PROFILER_PATH") ||
+		strings.HasPrefix(key, "CORECLR_") || strings.HasPrefix(key, "COMPlus_")
 }
 
 func pathWithin(root, candidate string) bool {

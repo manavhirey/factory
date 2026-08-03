@@ -58,7 +58,7 @@ Never claim independence, a passing check, or a clean finding without evidence.
 """
 
 [mcp_servers.cwm_roslyn_navigator]
-command = "dotnet"
+command = "/usr/bin/dotnet"
 args = ["/opt/factory/plugin-artifacts/dotnet-quality/CWM.RoslynNavigator.0.8.0/tools/net10.0/any/CWM.RoslynNavigator.dll"]
 startup_timeout_sec = 30
 tool_timeout_sec = 120

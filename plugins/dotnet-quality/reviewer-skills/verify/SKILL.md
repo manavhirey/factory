@@ -129,7 +129,11 @@ Output: PASS / WARN (with file list)
 
 ### Phase 7: Diff Review
 
-Analyze `git diff --stat` and `git diff` (staged + unstaged) for:
+For a local change, analyze `git diff HEAD --stat` and `git diff HEAD` (staged
++ unstaged), plus `git status --short --untracked-files=all` and the contents
+of relevant paths from `git ls-files --others --exclude-standard`. For a PR,
+use the supplied base and head revisions (for example, `git diff base...head`)
+instead of assuming local `HEAD` is the review scope. Check all of that for:
 - Accidental or unrelated file changes (`.vs/`, `bin/`, `obj/`, `.env`, secrets)
 - Debug leftovers (`Console.WriteLine`, `#if DEBUG` in production paths)
 - Unresolved TODO/HACK/FIXME markers
@@ -148,7 +152,7 @@ A single pass rarely produces all-green. The loop is the point:
 
 ### Final Summary
 
-```
+```markdown
 ## Verification Results
 
 | Phase | Result | Details |
@@ -170,7 +174,7 @@ include the verification report in the PR description.
 
 ## Example
 
-```
+```text
 User: /verify
 
 Claude: Running 7-phase verification pipeline...

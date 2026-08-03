@@ -50,7 +50,7 @@ line count. A one-line middleware change outranks a 300-line rename.
 
 ### Step 2: MCP Analysis (before reading any file)
 
-```
+```text
 detect_antipatterns(projectFilter: "affected-project")   → async void, DateTime.Now, new HttpClient(), broad catch
 get_diagnostics(scope: "project", path: "affected-project") → new warnings, nullability issues
 ```
@@ -61,7 +61,7 @@ Distinguish newly introduced findings from pre-existing ones — focus on new.
 
 For each modified public API:
 
-```
+```text
 find_references(symbolName: "ModifiedType")              → count consumers; high count = high risk
 get_dependency_graph(symbolName: "ModifiedMethod", depth: 2) → ripple effects
 ```
@@ -70,12 +70,14 @@ Check whether callers handle changed return types and new error cases.
 
 ### Step 4: Architecture Compliance
 
-Verify dependency direction (Domain → nothing; Infrastructure → Application →
-Domain) via `get_project_graph` and `detect_circular_dependencies`. Per
-architecture: VSA features don't cross-reference; Clean Architecture domain has
-zero project references; Modular Monolith modules communicate only via
-integration events — `find_references` on a module's DbContext should resolve
-only inside that module.
+Derive the declared architecture baseline from solution and project files,
+architecture tests, and project documentation, then verify its dependency
+direction via `get_project_graph` and `detect_circular_dependencies`. Do not
+impose a universal Clean Architecture graph: preserve documented project
+references and composition-root wiring exceptions. Apply VSA or Modular
+Monolith boundary rules only when the declared baseline requires them;
+`find_references` on a module's DbContext should then resolve only within the
+boundaries declared for that module.
 
 ### Step 5: Manual Review — Priority Order
 
@@ -84,7 +86,7 @@ Review what tools can't catch, highest-risk areas first:
 | Priority | Area | Check |
 |---|---|---|
 | 1 | Data access | N+1 (missing `Include`/projection), raw SQL with user input, missing `CancellationToken` |
-| 2 | Security | Every endpoint has explicit `[Authorize]`/`[AllowAnonymous]`, input validated, no secrets in code, no PII in logs |
+| 2 | Security | Endpoint authorization matches the declared security baseline (including explicit attributes when required), input validated, no secrets in code, no PII in logs |
 | 3 | Concurrency | Token propagated end-to-end, no `.Result`/`.Wait()`, thread-safe shared state |
 | 4 | Integration | Retry/timeout on external calls, consumer idempotency, no swallowed exceptions |
 | 5 | Correctness | Business logic, edge cases (empty/null/concurrent), entities mapped to DTOs at the boundary |
@@ -126,7 +128,7 @@ bury a security bug under naming nits.
 
 ## Example
 
-```
+```text
 User: /code-review the changes in this PR
 
 Claude: 7 changed files across 3 projects. CreateOrder touches data access

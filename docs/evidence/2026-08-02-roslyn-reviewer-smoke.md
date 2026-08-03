@@ -65,8 +65,63 @@ Factory scanned the canonical plugin bundle, `/opt/factory/plugin-artifacts`,
 and the installed agent/reviewer trees below Codex home. Validation files were
 worker-owned mode `0600` and directories mode `0700`. The reviewed agent plus
 sorted reviewer-asset hash-list digest was
-`5e5eda0e3a0200be24c2d75ec56aaf1f9c551a83f113548891bfb6bddb6ca35d`;
+`877630c67a15758a43cabda0b8868bfc337c9dc9a9b9d13502961b9506596a9f`;
 the manifest remains the canonical complete list of its eight asset files.
+
+## Review remediation and clean semantic rebuild
+
+The post-PASS review found that the tracked smoke fixture was a semicolon-only
+class with no `Describe` member. The earlier named-reviewer transcript could
+therefore only have come from stale build state and is invalid as acceptance
+evidence. The fixture now uses a braced class and declares
+`public string Describe() => "reviewer semantic smoke";`.
+
+A fresh isolated checkout contained no `bin/` or `obj/` directory below the
+smoke project before validation. Building that corrected tracked source with
+.NET 10 completed in 3.42 seconds with zero warnings and zero errors. The real
+Factory plugin health test then passed in 3.09 seconds against the newly built
+assembly.
+
+A separate direct JSON-RPC run against the pinned server produced the following
+fresh semantic results:
+
+- `find_symbol(name: "ReviewerHealthMarker", kind: "type")` resolved the public
+  class in `ReviewerHealth/ReviewerHealthMarker.cs` at line 3.
+- `get_symbol_detail(symbolName: "Describe", containingType:
+  "ReviewerHealthMarker")` resolved a public method with signature
+  `Factory.PluginHealth.ReviewerHealthMarker.Describe()` and return type
+  `string` at line 5.
+- `get_symbol_source(symbolName: "ReviewerHealthMarker", includeBodies: true)`
+  returned the corrected tracked body, including the exact string
+  `"reviewer semantic smoke"`.
+
+These results replace the stale named-specialist transcript below as the
+acceptance evidence for semantic activation.
+
+Post-review validation also passed the focused remediation suite under the
+actual worker UID and umask in 2.330 seconds. The manager regression uses the
+production nil lookup, nil probe, and empty Codex-home arguments and proves a
+semantic `CallToolResult` error makes manager health unhealthy. Reader-release,
+lazy-home, absolute-runner, unsafe-environment, artifact-root component,
+semantic-attempt-limit, bounded-stderr, and process-state assertion tests all
+passed.
+
+Two complete worker-package attempts ran every other test successfully but each
+reproduced the independently baseline-confirmed
+`TestTimeoutStopsIgnoringProcessGroup` timing failure at 7.21 and 7.75 seconds.
+The exact test passed alone in 7.18 seconds. This evidence therefore does not
+claim a clean full worker-package pass. Go formatting, `go vet`, the worker /
+control-plane import boundary, Node-free build tooling, all three operator
+binaries, and launcher checks passed. UI lint, type checking, all 40 component
+tests, the production build with unchanged embedded assets, and all 11
+real-server Chromium tests passed.
+
+All seven reviewer skill folders passed the skill validator after the
+correctness and Markdown-fence repairs. Complete retained-package plus
+extracted-tree hashing measured 0.3608, 0.2499, 0.2578, 0.2586, and 0.2546
+seconds on the target (0.2578-second median). That is below one percent of the
+30-second health interval, so periodic full rehashing remains intentionally
+fail-closed; an mtime cache would weaken integrity for negligible savings.
 
 ## Independent re-review
 
@@ -82,7 +137,7 @@ official hashes. Its Docker full-suite child-polling failures reproduced on the
 unchanged baseline, confirming that environment-sensitive failure was not
 introduced by this patch.
 
-## Named specialist smoke
+## Superseded named specialist smoke
 
 The first post-repair named-agent smoke successfully reviewed the disposable
 diff and used Roslyn, but its parent initially attempted a full-history custom
@@ -90,9 +145,9 @@ role fork. Codex rejected that launch before agent creation, and the parent
 retried with isolated context. The orchestration prompt was then corrected to
 require `fork_turns="none"` explicitly.
 
-The final bounded rerun exited zero with an empty stderr trace and no launch
-retry. The named `dotnet_quality_reviewer` loaded its reviewed instructions,
-built the disposable project with zero warnings and errors, and returned:
+The earlier bounded rerun reported the following text, but the later fixture
+audit proved that output was inconsistent with tracked source. It is retained
+only to document the failure mode and must not be used as passing evidence:
 
 ```text
 NAMED_REVIEWER: dotnet_quality_reviewer — no findings; build passed with 0 warnings and 0 errors.
@@ -100,6 +155,5 @@ ROSLYN_SEMANTIC_EVIDENCE: cwm_roslyn_navigator.get_symbol_detail resolved public
 VERDICT: PASS — bounded diff is review-only; no tracked worktree changes.
 ```
 
-Only ordinary `bin/` and `obj/` build outputs were created in the disposable
-repository; tracked and staged diffs remained empty. Raw runtime logs remain
-outside the repository and contain no evidence needed for review.
+The clean rebuild and direct semantic results above are the authoritative
+replacement evidence.

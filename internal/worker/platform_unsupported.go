@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+func fileOwnerID(os.FileInfo) (int, bool) { return 0, false }
+
 func ensureSupportedPlatform() error {
 	return errors.New("factory-worker is supported only on Unix")
 }
