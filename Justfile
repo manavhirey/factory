@@ -12,29 +12,11 @@ build:
     mkdir -p "$build_directory"
     go build -o "$build_directory/factory-server" ./cmd/factory-server
     go build -o "$build_directory/factory-worker" ./cmd/factory-worker
-    go build -o "$build_directory/factory-poller" ./cmd/factory-poller
     printf 'Factory binaries built in %s\n' "$build_directory"
 
 # Start one control plane and worker. Pass a worker config path when needed.
 run config="":
     @if [[ -n "{{config}}" ]]; then ./scripts/run-local.sh "{{config}}"; else ./scripts/run-local.sh; fi
-
-# Poll configured issue queues continuously. GitHub queues require authenticated gh.
-poll config="":
-    @if [[ -n "{{config}}" ]]; then go run ./cmd/factory-poller -config "{{config}}"; else go run ./cmd/factory-poller; fi
-
-# Run one issue-queue pass and exit. GitHub queues require authenticated gh.
-poll-once config="":
-    @if [[ -n "{{config}}" ]]; then go run ./cmd/factory-poller -config "{{config}}" -once; else go run ./cmd/factory-poller -once; fi
-
-# Safely test GitHub queue matching without contacting the control plane or writing the ledger.
-poll-test config="" queue="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    args=(-test-github)
-    if [[ -n "{{config}}" ]]; then args+=(-config "{{config}}"); fi
-    if [[ -n "{{queue}}" ]]; then args+=(-queue "{{queue}}"); fi
-    go run ./cmd/factory-poller "${args[@]}"
 
 # Install pinned UI dependencies.
 ui-install:
@@ -63,6 +45,14 @@ format-check:
 vet:
     go vet ./...
 
+# Fail on reachable Go vulnerabilities using the supported patched toolchain.
+vuln:
+    go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+# Run correctness and dead-code checks without style-only churn.
+staticcheck:
+    go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 -checks 'SA*,U1000' ./...
+
 # Prove workers do not import control-plane implementation code.
 boundary:
     @! go list -deps ./internal/worker | grep -qx 'github.com/owainlewis/factory/internal/controlplane'
@@ -71,13 +61,26 @@ boundary:
 test:
     go test -timeout 5m ./...
 
+# Race-check worker coordination and process cancellation paths.
+test-worker-race:
+    go test -timeout 5m -race ./internal/worker -run '^(TestPeriodicRegistrationCannotOvertakeRetainedCapacityHandoff|TestConfigurationStableIdentityLockAndHealthRecovery|TestHealthFailureCancelsRetryingClaimBeforeServerRecovery|TestCommittedClaimBecomesFailedWhenHealthChangesBeforeResponse|TestCancellationStopsCompleteProcessGroup)$'
+
 # Test the Node-free build and Just command surface.
 test-tooling:
     ./scripts/test-build.sh
+    ./scripts/test-update-go-minimum.sh
 
 # Test local startup, readiness, and signal handling.
 test-launcher:
     ./scripts/test-run-local.sh
 
+# Build a tagged release set from the current checkout.
+release version commit output="dist":
+    ./scripts/release.sh "{{version}}" "{{commit}}" "{{output}}"
+
+# Rebuild twice and verify every release target and native version output.
+test-release:
+    ./scripts/test-release.sh
+
 # Run the normal local and CI checks, excluding the slower browser suite.
-check: format-check vet boundary test ui-check test-tooling test-launcher
+check: format-check vet vuln staticcheck boundary test ui-check test-tooling test-launcher

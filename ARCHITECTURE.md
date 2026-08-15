@@ -2,542 +2,353 @@
 
 > **Status:** Current implementation
 >
-> **Verification basis:** Working tree based on commit `2d732ec`
+> **Verification basis:** `upstream/main` at commit `561e883`
+>
+> **Future direction:** The proposed
+> [Cloud Run agent backend](docs/cloud-run-agents/design.md) adds elastic
+> execution without changing Factory's product lifecycle. The Software Factory
+> target architecture is a historical proposal superseded by Routines and Work.
+> This document describes code that exists today.
 
 ## 1. Executive summary
 
-Factory is a local control plane for running coding agents in Git repositories.
-It separates durable coordination from agent execution:
+Factory is a local-first control plane for repeatable software-engineering
+agents. An operator saves a prompt and execution settings as a Routine. Running
+or scheduling that Routine creates Work with one Target per repository. A
+persistent Worker claims each Target, prepares an isolated Git worktree, runs
+Pi, Codex, or Claude Code, streams events, and reports one terminal result.
 
-- `factory-server` stores work, assigns it, exposes the HTTP API, and serves the
-  embedded browser UI.
-- `factory-worker` has one stable identity and one agent runtime. It advertises
-  runtime capacity and provider access, acquires centrally managed repositories
-  on demand, and runs attempts in isolated Git worktrees.
-- `factory-poller` lists configured issue queues through provider CLIs and
-  submits matching tickets as ordinary control-plane tasks.
-- Codex or Claude Code performs the repository work as a child process of the
-  worker.
+The implementation has three main parts:
 
-The current task contract is a title, prompt, assigned worker, repository, and
-timeout. Callers may name the assignment directly or ask the control-plane
-scheduler to choose from cattle workers. The deployment is limited to a trusted
-user and loopback HTTP on one host.
+- `factory-server` owns durable state, scheduling, routing, the HTTP API, and
+  the embedded browser UI.
+- `factory-worker` owns runtime health, repository caches, worktrees, agent
+  processes, and cleanup or retention.
+- SQLite stores Routines, Work, Targets, executions, Attempts, events, Workers,
+  and repositories.
+
+The operator API is loopback-only. Workers make outbound polling requests to
+the server. Remote VM Workers use a separate TLS listener and per-Worker bearer
+credential. No server connection into a Worker host is required.
+
+Cloud Run is not implemented. The proposed backend keeps Factory as the source
+of truth and replaces a persistent Worker process with one disposable Job
+execution plus a verified recovery artifact.
 
 ## 2. System context
 
 ```text
-Operator
-   |
-   | browser or JSON over loopback HTTP
-   v
+Operator browser
+      |
+      | loopback HTTP and JSON
+      v
 factory-server
-   |-- embedded React UI
-   |-- control-plane API and scheduler
-   `-- SQLite
-           ^
-           | registration, polling, leases, events, completion
-           |
-factory-worker (one identity and one runtime)
-   |-- bounded on-demand repository cache
-   |-- optional legacy static checkouts
-   |-- attempt manifests and owned Git worktrees
-   `-- Codex CLI or Claude Code CLI
-
-factory-poller
-   |-- GitHub through gh
-   |-- command adapters for other provider CLIs
-   `-- local dispatch ledger
-           |
-           `-- POST normal tasks to factory-server
+  |-- Routine scheduler and Work admission
+  |-- routing and lease state machine
+  |-- embedded React UI
+  `-- SQLite
+      ^
+      | register, claim, heartbeat, events, complete
+      | local HTTP or separate authenticated TLS
+      |
+factory-worker
+  |-- stable identity and N slots
+  |-- runtime capability probes
+  |-- bounded repository cache
+  |-- isolated worktrees and manifests
+  `-- Pi, Codex, or Claude Code
 ```
 
-Workers initiate every connection. The server does not connect to workers, and
-the system does not use WebSockets.
+The control plane decides what should run and records what happened. A Worker
+decides how to execute one claim safely on its machine. The agent runtime is a
+child process and does not receive a control-plane operator credential.
 
-## 3. Architectural invariants
+## 3. Current product model
 
-1. One worker identity has one immutable runtime, either `codex` or
-   `claude-code`.
-2. Every task freezes one worker and one control-plane repository. Routed work
-   may select a cattle worker before that repository exists in its local cache.
-3. Only a healthy, recently registered worker with free capacity can claim its
-   queued work.
-4. A lease token owns one active attempt. Active operations require a matching,
-   unexpired lease. A terminal completion request with the original token may be
-   replayed; the stored outcome wins.
-5. Agent processes start with a worker-owned worktree below that worker's data
-   directory as their working directory.
-6. Cleanup fails closed when the manifest, repository, branch, path, process,
-   or Git worktree identity cannot be proved.
-7. Existing worktrees with unpublished, dirty, failed, cancelled, lost, or
-   uncertain work are retained for inspection.
-8. The control plane and worker reject non-loopback server addresses because
-   remote authentication and transport security are not implemented.
-9. Operator builds embed the committed `web/dist` assets and do not require
-   Node.js.
-10. Polling is read-only. A queue and issue identity creates at most one task,
-    including across poller restarts and lost HTTP responses.
-11. Worker plugins are operator-enabled, versioned prompt bundles. They cannot
-    be activated by repository or task content and cannot execute lifecycle
-    code in the MVP.
+### Routine
 
-## 4. Components and dependencies
+A Routine is a reusable definition containing:
+
+- name and prompt;
+- runtime: `pi`, `codex`, or `claude-code`;
+- timeout and per-Work concurrency limit;
+- one or more managed repositories;
+- optional cron schedule and IANA timezone;
+- mutable generation and archived state.
+
+Updates use an expected generation. Admission snapshots the Routine so later
+edits do not change existing Work. A manual run uses an idempotency key.
+Scheduled admission polls every ten seconds and preserves the frozen pending
+snapshot while retrying a failed admission.
+
+### Work and Target
+
+One Routine admission creates one Work and one Target per selected repository.
+Work stores the Routine snapshot, source (`manual` or `schedule`), schedule time,
+and aggregate state. A Target stores its resolved prompt, repository identity,
+required runtime, timeout, assigned Worker, result, and failure state.
+
+Target states are `blocked`, `queued`, `preparing`, `running`, `succeeded`,
+`failed`, and `cancelled`. Work state is derived from all Targets as `blocked`,
+`queued`, `running`, `succeeded`, `failed`, `partial`, or `cancelled`.
+
+A Target starts blocked when no eligible Worker can currently accept it. A
+later claim can route it when a healthy Worker advertises the runtime and
+repository access. Routine concurrency limits how many sibling Targets may be
+queued or active at once.
+
+### Execution and Attempt
+
+An Execution is the durable assignment of one Target to one Worker and runtime.
+An Attempt is one leased try of that Execution. An explicit retry of a failed or
+cancelled Target requeues its Execution, increments retry history, and warns
+that external effects may repeat.
+
+An Attempt begins in `preparing`, moves to `running` after the Worker reports
+its supervisor identity, then ends as `succeeded`, `failed`, `cancelled`, or
+`lost`. It owns ordered bounded events, a bounded result or error, process
+identity, and a 30-second lease.
+
+### Worker and repository
+
+A Worker has one durable ID, display name, labels, capacity, health, runtime
+capabilities, source access, repository advertisements, and retained-worktree
+inventory. One Worker can advertise several runtimes and run 1 to 100 Attempts,
+with ten slots by default.
+
+The control plane owns a catalog of managed GitHub repositories. Eligible
+Workers clone them on demand with `gh`, keep at most 100 cache entries, fetch
+before an Attempt, and resolve the current base branch and commit. Legacy
+static repository paths remain readable through Worker configuration.
+
+## 4. Architectural invariants
+
+1. SQLite and the control plane are the authority for Work and Attempt state.
+2. A claim is assigned only to its selected, healthy, online Worker with a ready
+   runtime, free capacity, and repository availability.
+3. A random lease token owns one active Attempt. The server stores its digest,
+   not the token. Active mutations require the matching unexpired lease.
+4. Claim request IDs and terminal completion are idempotent. Replays cannot
+   create two Attempts or replace a stored terminal outcome.
+5. Every runtime starts in a Worker-owned worktree. The supervisor owns its
+   process group and enforces cancellation, timeout, lease loss, and parent
+   loss.
+6. Cleanup fails closed unless repository, manifest, path, branch, process, and
+   worktree identity can all be proved.
+7. Dirty, failed, cancelled, lost, unpublished, or uncertain worktrees are
+   retained for inspection. Clean unchanged or proved-published work may be
+   removed.
+8. Plain HTTP accepts loopback clients only. Remote Workers require TLS,
+   one-time enrollment bound to a stable Worker ID, and a stored bearer
+   credential.
+9. Routine admission snapshots prompt, runtime, repositories, timeout,
+   concurrency, generation, and schedule context.
+10. Operator builds embed committed `web/dist` assets and do not require Node.js
+    at runtime.
+11. Worker plugins are operator-enabled, versioned prompt bundles. Repository
+    or Work content cannot activate them, and they cannot execute lifecycle code
+    in the MVP.
+
+## 5. Components
 
 ### Control plane
 
-`cmd/factory-server` starts the Go HTTP server. It:
+`cmd/factory-server` loads optional bootstrap TOML, opens SQLite, applies
+embedded migrations, sweeps expired leases, starts the Routine scheduler,
+serves the local API and UI, and optionally starts the remote Worker TLS
+listener. Shutdown stops schedulers first and gives HTTP servers ten seconds.
 
-- validates and binds a loopback address, `127.0.0.1:7337` by default;
-- opens the SQLite store and applies embedded migrations;
-- sweeps expired leases at startup and every five seconds;
-- mounts the API and embedded UI on one origin;
-- writes structured JSON logs;
-- allows ten seconds for HTTP shutdown.
+`internal/controlplane` owns validation, transactions, Work admission, routing,
+claiming, leases, event ingestion, completion, cancellation, retry, pagination,
+overview aggregates, Worker authentication, and backup or restore validation.
 
-`internal/controlplane` owns the API, validation, state transitions, scheduling,
-metrics, pagination, and persistence. Claim selection is transactional and FIFO
-by execution creation time for the requesting worker.
-
-SQLite runs with foreign keys, WAL journaling, a five-second busy timeout, and
-at most eight open connections. The default database is
+SQLite uses foreign keys, WAL journaling, a five-second busy timeout, and a
+bounded connection pool. The default database is
 `~/.factory/server/factory.sqlite3`.
 
-### Issue poller
-
-`cmd/factory-poller` tests GitHub matching without mutation with `-test-github`,
-runs one submitting pass with `-once`, or polls continuously. Each configured
-queue names a source, project, native status, required labels, prompt, and
-timeout. Non-GitHub command queues also retain an explicit worker and
-repository key for compatibility.
-
-GitHub support is built in and invokes the authenticated `gh issue list`
-command. A configured GitHub queue fails at startup with installation and
-authentication guidance when `gh` is unavailable. Other source names invoke
-one configured executable without a shell. Factory appends `--project`,
-`--status`, and repeated `--label` arguments. The command returns the normalized
-issue shape documented in [docs/poller.md](docs/poller.md). This keeps provider
-credentials and API clients outside Factory.
-
-For GitHub, the poller submits the repository remote and a GitHub source-access
-requirement. In the task-creation transaction, the control plane chooses the
-healthy online cattle worker with GitHub access and the lowest `(active +
-queued) / capacity` load, breaking an exact tie by worker ID. A legacy worker
-that already advertises the checkout is also eligible. It excludes repositories
-without retained-worktree headroom and excludes a cattle worker without cache
-headroom unless that repository is already cached. It then freezes the selected
-worker and repository on the execution. The poller writes the exact task request
-to its own SQLite ledger, submits through
-`POST /api/v1/tasks`, and records the returned task ID. Its default state is
-`~/.factory/poller/poller.sqlite3`.
+The backup path validates a live database and uses `VACUUM INTO` to publish a
+mode-`0600` standalone snapshot without replacement. Restore validates a marked
+snapshot, rejects SQLite sidecars, applies supported migrations in a private
+staging directory, and publishes only a complete destination.
 
 ### Worker
 
-`cmd/factory-worker` starts one worker manager, prints a worker identity, runs
-manual cleanup, or starts the internal attempt supervisor. The manager:
+`cmd/factory-worker` loads TOML configuration and starts one manager. The
+manager:
 
-- resolves and locks its data directory;
-- creates or loads a durable worker ID;
-- resolves any optional legacy repository paths and normalizes their `origin`
-  identities;
-- checks Git and runtime health and automatically probes local GitHub access;
-- loads only explicitly enabled plugins from an operator-managed directory,
-  validates their pinned provenance and prompt assets, and checks required
-  commands before becoming healthy;
-- clones or fetches assigned managed repositories into a bounded cache before
-  agent startup;
-- registers every ten seconds and polls for claims every two seconds with
-  jitter;
+- creates or loads its stable identity and local credential;
+- probes Git, `gh`, and configured runtime readiness;
+- loads explicitly enabled plugins from an operator-managed directory, validates
+  pinned provenance and prompt assets, and checks required commands before
+  becoming healthy;
+- registers every ten seconds and polls for claims about every two seconds;
+- acquires managed repositories into a bounded local cache;
 - renews active leases every ten seconds;
-- runs up to the configured capacity, from one to four attempts;
-- reconciles manifests, worktrees, and process groups after restart.
+- starts up to the configured number of isolated sessions;
+- reconciles manifests, worktrees, and owned process groups after restart.
 
-The supervisor is a subprocess of `factory-worker`. It owns the runtime process
-group and enforces cancellation, timeout, lease loss, and parent-process loss.
-Unix process-group behavior is required, so Windows workers are unsupported.
+The supervisor is a subprocess of `factory-worker`. It anchors ownership of the
+runtime process group. Unix process-group behavior is required, so Windows
+Workers are unsupported.
 
 ### Agent runtimes
 
-The worker launches the configured runtime non-interactively:
+The Worker launches each runtime non-interactively in the prepared checkout:
 
-- Codex uses `codex exec` with JSON events and a file for the last message.
-- Claude Code uses `claude --print` with streaming JSON and bypassed permission
-  prompts.
+- Pi uses `--print --no-session` and captures the final plain-text result.
+- Codex uses `codex exec` with JSON events and a last-message file.
+- Claude Code uses `claude --print` with streaming JSON.
 
-Both runtimes receive the same generated prompt and produce the same bounded
-event and completion contract. When a worker enables bundled plugins, their
-deterministically ordered prompt context is inserted after Factory's safety
-preamble and before the task description. Empty plugin configuration preserves
-the pre-plugin prompt bytes.
+Runtime output is normalized into the same Attempt event and completion
+contract. Event batches are at most 100 events and 256 KiB; each event is at
+most 64 KiB; one Attempt stores at most 10 MiB of events. Results are at most
+256 KiB and errors at most 64 KiB.
+
+When a Worker enables bundled plugins, their deterministically ordered prompt
+context is inserted after Factory's safety preamble and before the Work prompt.
+Only Attempts using the plugin's declared runtime receive that context. Empty
+plugin configuration preserves the upstream prompt bytes.
 
 ### Browser UI
 
-`web/src` is a React and TypeScript application with Overview, Work, Workers,
-Task detail, and Delegate task views. It polls the same-origin API.
+`web/src` is a React and TypeScript single-page application. It exposes
+Overview, Routines, Work, Workers, and Repositories, with detail views for each
+operational resource. It polls the same-origin API.
 
 `web/dist` is generated, committed, and embedded by `web/embed.go`. The server
-uses an SPA fallback for application routes, immutable caching for versioned
-assets, and restrictive browser security headers.
+uses an SPA fallback, immutable caching for versioned assets, and restrictive
+security headers. Node.js is needed only when UI source changes.
 
-Node.js is a contributor dependency only when UI source changes.
+## 6. Critical flows
 
-## 5. Critical flows
+### Routine admission
 
-### Startup and registration
+1. The operator runs a Routine with a request key, or the scheduler claims a
+   due occurrence.
+2. The server freezes the Routine generation and repository list.
+3. One Work and one Target per repository are inserted transactionally.
+4. Routing selects compatible Workers where possible. Unroutable Targets stay
+   blocked with a reason.
+5. The same manual request key or scheduled occurrence cannot admit duplicate
+   Work.
 
-1. The server validates its data root, opens SQLite, applies migrations, and
-   marks already expired attempts as `lost`.
-2. The worker validates its TOML, data directory, runtime, optional legacy
-   repositories, and explicitly enabled plugin manifests and dependencies.
-3. The worker reconciles durable attempt manifests before accepting new work.
-4. A healthy worker registers its identity, runtime, capacity, provider access,
-   managed-repository acquisition capability, optional legacy repositories,
-   bounded cached repository IDs, retained worktrees, and disposed attempt IDs.
-5. A worker is shown as offline when its last registration is more than 30
-   seconds old.
+### Claim and execution
 
-### Task creation and claiming
-
-1. A caller submits a unique `request_key`, title, description, optional timeout,
-   and either an explicit worker/repository pair or a repository remote plus
-   source-access route.
-2. For a route, the control plane requires an enabled managed repository,
-   chooses an eligible worker by fair load, and freezes both IDs. It then
-   creates one task and one queued execution. Reusing the request key returns
-   the original task.
-3. The assigned worker polls its claim endpoint with a unique request ID and
-   lease token.
-4. The control plane verifies worker health, recency, capacity, runtime,
-   repository advertisement, and repository retention capacity.
-5. It selects the oldest eligible queued execution, creates a preparing
-   attempt, stores only a digest of the lease token, and returns the claim.
-6. An empty response is idempotent for five minutes. A successful response is
-   idempotent while its attempt remains active and its lease remains valid.
-
-### Issue polling and dispatch
-
-1. The poller recovers every pending stored request before reading a source.
-2. For each queue, it asks the provider CLI for issues matching the configured
-   project, status, and labels.
-3. GitHub results and normalized command results are validated and limited to
-   100 issues.
-4. GitHub polling keeps only issue identity, URL, title, state, and labels. The
-   poller composes the trusted queue prompt followed by that clearly marked
-   untrusted context and a live-state revalidation instruction.
-5. It stores the exact task request before posting it to the control plane.
-6. The existing task request key makes a lost response safe to replay.
-7. Later polls skip the same queue, source, project, and issue key.
-
-Source polling never changes the issue. The agent prompt may tell the worker to
-use its installed provider CLI to update the issue and open a pull request.
-
-### Attempt execution
-
-1. The worker validates the claim identity, assignment, runtime, repository ID,
-   and remote identity.
-2. It uses a compatible legacy checkout or serially clones/fetches the managed
-   repository. Managed work starts at the fetched remote default-branch commit.
-3. It creates a branch named
-   `factory/<task-prefix>-<attempt-prefix>` and an owned worktree.
-4. It writes a protected attempt manifest, including the sorted active plugin
-   identities or an explicit empty set, before starting the runtime.
-5. The internal supervisor starts, then the worker transitions the attempt to
+1. A healthy Worker registers capabilities and polls with a fresh claim request
+   ID and lease token.
+2. In one transaction, the server may materialize a blocked route or reroute a
+   queued Target, checks capacity and Routine concurrency, creates an Attempt,
+   and moves Execution and Target to `preparing`.
+3. The Worker acquires or refreshes the repository, resolves its base commit,
+   creates a branch and worktree, writes a manifest containing the sorted active
+   plugin identities or an explicit empty set, then starts the supervisor.
+4. The Worker reports process identity and the server moves the lifecycle to
    `running`.
-6. Runtime output is sent as ordered, idempotent event batches.
-7. The worker renews the 30-second lease while the supervisor is active.
-8. Completion records a bounded result, error, and outcome, and moves the
-   execution to `succeeded`, `failed`, or `cancelled`.
+5. Heartbeats extend the lease by 30 seconds and return cancellation state.
+6. Ordered events are appended idempotently. Completion verifies the lease and
+   stores the terminal result once.
+7. The Worker removes proved-safe worktrees and reports retained ones back to
+   the control plane.
 
-### Cancellation and lease expiry
+### Cancellation, lease loss, and retry
 
-- Cancelling queued work moves its execution directly to `cancelled`.
-- Cancelling preparing or running work sets `cancellation_requested`. The worker
-  observes the flag on its next lease renewal, stops the runtime process group,
-  and reports a cancelled attempt.
-- An expired preparing or running lease moves the attempt to `lost` and its
-  execution to `failed`.
-- Retrying is an explicit operator action available only for failed or cancelled
-  executions. It returns the existing execution to `queued` and increments its
-  retry count.
+Queued or blocked Targets cancel immediately. Active cancellation is stored on
+the Target and Execution, returned by the next heartbeat, and enforced by the
+supervisor. If lease renewal fails or the 30-second deadline passes, the
+supervisor stops the process group and the control plane marks the Attempt
+lost. Startup and periodic sweeps recover expired leases after server failure.
 
-### Completion and cleanup
+Only failed or cancelled Targets can be retried. Retry preserves the Target and
+Attempt history, selects a currently eligible Worker, and creates the next
+Attempt when claimed.
 
-The worker automatically removes a successful worktree only after proving it is
-clean and either unchanged from its base commit or that every new commit is
-published. It may also delete the managed local branch when that branch is safe
-and unused.
+## 7. API and security boundaries
 
-Other outcomes and uncertain publication are retained. Manual cleanup first
-prints the manifest, path, branch, Git status, and reason. A separate
-`--confirm` run removes the worktree but preserves the local branch.
-The Worker view reports retained paths and ready-to-copy cleanup commands.
+The local listener exposes health plus operator and Worker routes under
+`/api/v1`: Workers, repositories, Routines, Work, overview, Attempts, and event
+history. It rejects non-loopback clients before route handling.
 
-At startup, the worker stops process groups recorded as active, compares each
-manifest with server state and Git state, resumes only provably safe cleanup,
-and becomes unhealthy when identity cannot be established.
+The optional remote listener exposes only health, enrollment exchange, Worker
+registration and claims, and the active Attempt lifecycle. Creating an
+enrollment remains a local operator action. Enrollment tokens are one-time and
+short-lived; exchange installs a per-Worker credential. Attempt routes also
+check that the authenticated Worker owns the Attempt.
 
-## 6. Interfaces and data
+Factory is a trusted single-operator system. It has no multi-user tenant model.
+Agents may execute repository code using credentials already available on the
+Worker host. Worktrees isolate Git state, not hostile code. The product must not
+describe a Worker as a security sandbox.
 
-### Operator API
+The plugin directory, enabled plugin list, manifests, prompt assets, and pinned
+artifacts are trusted operator policy. Factory validates paths and manifests,
+rejects symlink traversal, and rechecks dependencies and semantic health, but
+plugin prompts still execute within the Attempt's agent context and OS identity.
 
-```text
-GET    /healthz
-GET    /api/v1/metrics/summary?window=24h|7d|30d|all
-GET    /api/v1/workers
-GET    /api/v1/workers/{worker_id}
-GET    /api/v1/repositories
-POST   /api/v1/repositories
-GET    /api/v1/repositories/{repository_id}
-PUT    /api/v1/repositories/{repository_id}/enabled
-GET    /api/v1/tasks?limit={1..200}&cursor={cursor}
-POST   /api/v1/tasks
-GET    /api/v1/tasks/{task_id}
-DELETE /api/v1/tasks/{task_id}
-POST   /api/v1/tasks/{task_id}/cancel
-POST   /api/v1/executions/{execution_id}/retry
-GET    /api/v1/attempts/{attempt_id}/events?after={sequence}&limit={1..500}
-```
+## 8. Persistence and migration
 
-Task deletion is limited to terminal history whose worktree disposition has
-been acknowledged. It refuses to delete history for a retained worktree.
+Migrations are embedded from `migrations/` and applied in order. Migration 27
+introduces the current Routines and Work model. Migration 28 adds the current
+Work-only claim protocol and rejects incompatible old Workers. Supported legacy
+Definitions, schedules, repositories, and execution history are converted;
+unsupported legacy provider admission is blocked and reported rather than
+silently discarded.
 
-### Worker API
+Current lifecycle tables include `routines`, `routine_repositories`, `work`,
+`work_targets`, `executions`, `attempts`, `attempt_events`, `workers`,
+`repositories`, Worker repository state, claim request deduplication, and
+Worker enrollment or credentials. Older migration tables may remain for
+history and upgrade compatibility but are not part of the current UI or
+admission path.
 
-```text
-PUT    /api/v1/workers/{worker_id}
-POST   /api/v1/workers/{worker_id}/claims
-GET    /api/v1/attempts/{attempt_id}
-POST   /api/v1/attempts/{attempt_id}/start
-PUT    /api/v1/attempts/{attempt_id}/heartbeat
-POST   /api/v1/attempts/{attempt_id}/events
-POST   /api/v1/attempts/{attempt_id}/complete
-```
+## 9. Future execution backend boundary
 
-Mutations require JSON and reject cross-origin browser requests. API requests
-are bounded by operation-specific byte limits.
+The product direction separates three choices:
 
-### Persistent model
+| Choice | Current | Proposed |
+| --- | --- | --- |
+| Execution backend | Persistent local or VM Worker | Cloud Run Job |
+| Agent runtime | Pi, Codex, Claude Code | Same runtime contract |
+| Provider and model | Local subscription or API access | API-backed access |
 
-```text
-Worker 1 --- * WorkerRepository * --- 1 Repository
-Task   1 --- 1 Execution       1 --- * Attempt 1 --- * AttemptEvent
-```
+Persistent Workers remain the best path for subscription sessions, warm
+caches, and inspectable worktrees. Cloud Run is intended for bursty parallel
+Work where a disposable container and API-backed model are acceptable.
 
-- A task stores the operator request and repository.
-- A repository is the central fleet record. Its enabled flag gates new routed
-  work but does not rewrite existing assignments.
-- A worker-repository row may be a legacy static advertisement or the dynamic
-  association frozen when a cattle worker is selected.
-- An execution stores its assigned worker, required runtime, state,
-  cancellation flag, and explicit retry count.
-- An attempt stores one claim, lease, process identity, result, and outcome.
-- Attempt events store ordered runtime and lifecycle payloads.
-- Claim requests make empty and successful claims idempotent.
-
-Task lists use an opaque cursor ordered by creation time and ID. Event lists use
-the last sequence number. Prompts remain in task detail but are omitted from the
-task list.
-
-### Limits
-
-| Contract | Limit |
-| --- | ---: |
-| Worker concurrency | 1 to 4 |
-| Task description | 64 KiB |
-| Default task timeout | 2 hours |
-| Maximum task timeout | 8 hours |
-| Lease duration | 30 seconds |
-| Event batch | 100 events and 256 KiB |
-| Single event | 64 KiB |
-| Events stored per attempt | 10 MiB |
-| Completion result | 256 KiB |
-| Completion error | 64 KiB |
-| Retained and reserved worktrees per worker repository | 10 |
-| Managed repositories | 1,000 |
-| Cached repositories per worker | 100 |
-| Task page | 50 by default, 200 maximum |
-| Event page | 100 by default, 500 maximum |
-| Issues per queue pass | 100 |
-| Source command output | 4 MiB |
-| Source command stderr | 64 KiB |
-| Source command duration | 30 seconds |
-| Poller observations | 10,000 |
-
-### Files and configuration
-
-```text
-~/.factory/
-  bin/
-    factory-server
-    factory-worker
-    factory-poller
-  server/
-    factory.sqlite3
-    factory.sqlite3.v2-control-plane
-  worker.toml
-  poller.toml
-  poller/
-    poller.sqlite3
-  workers/<worker>/
-    worker-id
-    worker.lock
-    repositories/<repository-id>/
-    attempts/
-    disposed-attempts.json
-    worktrees/
-```
-
-The marker filename and contents retain compatibility with the earlier Go
-preview storage format. They do not represent a second application.
-
-`FACTORY_DATA_HOME` changes the default root. `FACTORY_WORKER_CONFIG` and
-`FACTORY_POLLER_CONFIG` select worker and poller TOML files.
-`FACTORY_BUILD_DIR`, `FACTORY_LISTEN`, `FACTORY_SKIP_BUILD`, and
-`FACTORY_WORKER_READY_SECONDS` configure local commands. Earlier `FACTORY_V2_*`
-names remain migration aliases in code and the local launcher, but are not
-operator-facing configuration.
-
-Relative worker data and optional legacy repository paths are resolved from the
-directory that contains the worker TOML. Managed repositories are configured by
-the control-plane API and cached below the worker data directory.
-
-## 7. Security and trust boundaries
-
-The current trust boundary is one trusted user on one host:
-
-- the server binds only to loopback and validates request host resolution;
-- there is no login, authorization, worker credential, TLS, or tenant boundary;
-- worker IDs identify local state but are not secrets;
-- the agent process has the worker OS user's permissions and can access anything
-  available to that user;
-- the enabled central repository catalog controls routed assignment. Workers
-  accept only canonical GitHub identities from that catalog and never clone an
-  arbitrary URL supplied by a ticket. This is not a filesystem sandbox;
-- provider CLIs own their credentials; the poller does not request, store, or
-  pass provider tokens;
-- workers advertise GitHub source access and managed acquisition only after a
-  successful local `gh auth status` probe; registrations contain no token;
-- configured source commands and queue prompts are trusted operator policy;
-- the plugin directory, enabled plugin list, manifests, and prompt assets are
-  trusted operator policy. Paths and manifests are validated and symlink
-  traversal is rejected, but the plugin prompt still executes within the same
-  agent context and OS identity as the task;
-- plugins cannot install dependencies or execute hooks during a task. Required
-  command presence is checked at startup and on periodic worker health checks;
-- issue fields are stored in the poller ledger and task prompt as untrusted
-  context;
-- lease tokens are random, sent over local HTTP, and stored as SHA-256 digests;
-- browser mutations must be same-origin and use JSON;
-- worker data directories, identity files, and manifests use restrictive
-  permissions and reject unsafe symlinks where identity matters;
-- an existing database must be a regular non-symlink file; its adjacent marker
-  validates the storage format, and a newly created marker uses mode `0600`;
-- cleanup proves ownership and Git identity before deleting a worktree.
-
-Factory must not be exposed directly to a network. Remote workers require
-authenticated and encrypted transport, scoped authorization, audit records,
-and a reviewed tenant model.
-
-## 8. Failure, capacity, and operations
-
-- Loss of the worker or lease fails the execution. Recovery is an explicit
-  retry, not automatic rescheduling.
-- Loss of the server stops agent process groups after the lease renewal
-  deadline.
-- Worker shutdown stops claiming, terminates active process groups, and reports
-  terminal state when the server remains available.
-- Server shutdown drains HTTP requests, stops the lease sweeper, checkpoints
-  the SQLite WAL, and closes the database.
-- A worker data directory is locked to one running worker identity.
-- Worktree reconciliation and cleanup prefer retention over destructive action.
-- Repository capacity counts active work, retained work, and completed attempts
-  whose local disposition has not been acknowledged. This prevents unbounded
-  worktree growth.
-- Task list responses are bounded by cursor pagination, but persistent task,
-  prompt, result, and error history grows until an operator deletes terminal
-  tasks. Factory has no age-based automatic retention job.
-- Event storage is bounded per attempt. Results, errors, prompts, and request
-  bodies also have byte limits.
-- One failed issue queue does not stop later queues in the same pass. Failed
-  source results create no observations. Failed task submissions remain pending
-  and replay before the next source poll.
-- A GitHub route with no eligible worker removes its unsubmitted pending row so
-  the next pass refetches the live issue before another routing attempt.
-- Poller observations are capped at 10,000. Submitted rows discard their stored
-  request body, but remain as deduplication records until the operator archives
-  and resets the ledger. An issue does not rearm after leaving and re-entering
-  its queue condition.
-
-Summary metrics are derived only from retained control-plane facts: execution
-counts and outcomes, queue and running counts, success and retry rates, median
-cycle time, and worker totals. Factory does not infer merged pull requests or
-triaged tickets from agent text.
-
-## 9. Verification
-
-The implementation is covered by:
-
-- control-plane store, HTTP, state-machine, migration, pagination, deletion,
-  metrics, and lease tests in `internal/controlplane`;
-- worker identity, configuration, registration, process supervision, runtime
-  output, cancellation, lease loss, restart reconciliation, and cleanup tests in
-  `internal/worker`;
-- issue-source validation, durable dispatch, HTTP replay, and restart
-  deduplication tests in `internal/poller`;
-- server and worker command tests in `cmd`;
-- embedded asset tests in `web`;
-- React unit, polling, and browser tests in `web/src`;
-- Just command-surface and local-launch checks in `scripts/test-build.sh` and
-  `scripts/test-run-local.sh`.
-
-The contributor check set is documented in [CONTRIBUTING.md](CONTRIBUTING.md).
+The proposed adapter does not make Cloud Run the scheduler or database.
+Factory still owns frozen input, Attempt identity, retry, cancellation, events,
+cost history, and the terminal result. Cloud Run owns disposable compute. A
+verified patch or Git recovery artifact replaces the retained-worktree
+guarantee for ephemeral execution. See the
+[Cloud Run design](docs/cloud-run-agents/design.md) for dispatch fencing,
+outbound control, least-privilege identity, failure recovery, and rollout.
 
 ## 10. Known limitations
 
-- Only local loopback deployments are supported.
-- Windows workers are unsupported.
-- There is no authentication, authorization, tenant isolation, or remote worker
-  transport.
-- A task has one execution assigned to one worker. Fan-out and cross-worker
-  rescheduling are not implemented.
-- Execution scheduling is pull-based FIFO per worker. There are no priorities,
-  cron triggers, or automatic retries.
-- GitHub is the only built-in issue source. Jira, Linear, and other providers
-  need a command adapter that implements the normalized issue JSON contract.
-- Poller configuration is file-based and has no UI. Issue observations do not
-  rearm or expire automatically.
-- Reusable workflows, scheduled automations, and a unified `factory` CLI are
-  proposed but not implemented.
-- Metrics do not confirm external outcomes such as merged pull requests or
-  closed tickets.
-- Terminal history requires explicit deletion. There is no time-based retention
-  policy.
-
-The current poller is documented in [docs/poller.md](docs/poller.md). More
-advanced behavior is described separately in the
-[workflow](docs/workflows/design.md),
-[GitHub ingest](docs/github-ingest/design.md), and [CLI](docs/cli/design.md)
-designs.
+- Only the embedded SQLite orchestration path exists.
+- Cloud Run execution profiles and elastic dispatch are designed but not
+  implemented.
+- Managed repository acquisition supports GitHub through `gh`.
+- The current Worker resolves a repository's base commit during Attempt
+  preparation, so a later retry can observe a newer default branch commit.
+- Remote Workers require operator-managed TLS certificates and enrollment.
+- Windows Workers are unsupported.
+- Execution isolates worktrees and process groups but does not sandbox hostile
+  repository code or network egress.
 
 ## 11. Source map
 
-| Area | Source |
+| Area | Primary files |
 | --- | --- |
-| Server process and defaults | `cmd/factory-server` |
-| Worker process and commands | `cmd/factory-worker` |
-| Poller process and commands | `cmd/factory-poller` |
-| HTTP API and state machine | `internal/controlplane/http.go`, `state.go` |
-| Persistence and metrics | `internal/controlplane/store.go`, `metrics.go` |
-| Database schema | `migrations` |
-| Shared contracts and limits | `internal/protocol` |
-| Worker orchestration | `internal/worker/manager.go`, `registration.go`, `claiming.go`, `attempt_lifecycle.go` |
-| Bundled worker plugins | `internal/worker/plugin.go`, `plugins/` |
-| Runtime supervision | `internal/worker/supervisor.go` |
-| Repository acquisition, Git worktrees, and cleanup | `internal/worker/repository_cache.go`, `git.go`, `reconcile.go`, `cleanup.go` |
-| Durable worker state | `internal/worker/identity.go`, `manifest.go` |
-| Issue sources and dispatch ledger | `internal/poller` |
-| State path compatibility | `internal/statepath` |
-| UI source and API client | `web/src` |
-| Embedded UI serving | `web/embed.go`, `web/dist` |
-| Build and checks | `Justfile` |
-| Local process launcher | `scripts/run-local.sh` |
+| Server startup and config | `cmd/factory-server/main.go`, `cmd/factory-server/config.go` |
+| HTTP routes and auth | `internal/controlplane/http.go`, `internal/controlplane/worker_auth.go` |
+| Routine and Work model | `internal/controlplane/routines.go`, `internal/protocol/routines.go` |
+| Schedule admission | `internal/controlplane/routine_scheduler.go`, `internal/controlplane/schedule_cron.go` |
+| Routing and claims | `internal/controlplane/routine_claim.go`, `internal/controlplane/state.go` |
+| Lease sweep and recovery | `internal/controlplane/server.go`, `internal/controlplane/recovery.go` |
+| Worker manager | `internal/worker/manager.go`, `internal/worker/registration.go`, `internal/worker/claiming.go` |
+| Attempt execution | `internal/worker/attempt_lifecycle.go`, `internal/worker/supervisor.go`, `internal/worker/events.go` |
+| Bundled Worker plugins | `internal/worker/plugin.go`, `plugins/` |
+| Git and worktrees | `internal/worker/git.go`, `internal/worker/repository_cache.go`, `internal/worker/reconcile.go` |
+| Protocol limits and types | `internal/protocol/types.go`, `internal/protocol/prompt.go` |
+| Schema | `migrations/027_routines_work.sql`, `migrations/028_work_claim_protocol.sql` |
+| Browser UI | `web/src/App.tsx`, `web/src/Routines.tsx`, `web/src/RoutineWork.tsx`, `web/src/Workers.tsx`, `web/src/Repositories.tsx` |

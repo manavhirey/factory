@@ -2,7 +2,7 @@ package controlplane
 
 import (
 	"bytes"
-	"encoding/base64"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +23,8 @@ type API struct {
 	store  *Store
 	logger *slog.Logger
 }
+
+const workerConnectionTimeout = 12 * time.Second
 
 type workerRegistrationRequest struct {
 	protocol.WorkerRegistration
@@ -55,7 +57,7 @@ type legacyWorkerResponse struct {
 	Online            bool                        `json:"online"`
 	Repositories      []protocol.Repository       `json:"repositories"`
 	RetainedWorktrees []protocol.RetainedWorktree `json:"retained_worktrees"`
-	CurrentTaskTitle  string                      `json:"current_task_title,omitempty"`
+	CurrentWorkTitle  string                      `json:"current_work_title,omitempty"`
 	RegisteredAt      time.Time                   `json:"registered_at"`
 	LastHeartbeat     time.Time                   `json:"last_heartbeat"`
 }
@@ -67,41 +69,158 @@ func NewHandler(store *Store, logger *slog.Logger) http.Handler {
 	api := &API{store: store, logger: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", api.health)
+	mux.HandleFunc("POST /api/v1/worker-enrollments", api.createWorkerEnrollment)
 	mux.HandleFunc("PUT /api/v1/workers/{worker_id}", api.registerWorker)
+	mux.HandleFunc("PUT /api/v1/workers/{worker_id}/heartbeat", api.heartbeatWorker)
 	mux.HandleFunc("POST /api/v1/workers/{worker_id}/claims", api.claim)
 	mux.HandleFunc("GET /api/v1/workers", api.listWorkers)
 	mux.HandleFunc("GET /api/v1/workers/{worker_id}", api.getWorker)
+	mux.HandleFunc("POST /api/v1/workers/{worker_id}/test", api.testWorkerConnection)
+	mux.HandleFunc("GET /api/v1/workers/{worker_id}/repository-options", api.getWorkerRepositoryOptions)
 	mux.HandleFunc("GET /api/v1/repositories", api.listManagedRepositories)
 	mux.HandleFunc("POST /api/v1/repositories", api.createManagedRepository)
 	mux.HandleFunc("GET /api/v1/repositories/{repository_id}", api.getManagedRepository)
+	mux.HandleFunc("GET /api/v1/repositories/{repository_id}/readiness", api.getManagedRepositoryReadiness)
 	mux.HandleFunc("PUT /api/v1/repositories/{repository_id}/enabled", api.setManagedRepositoryEnabled)
-	mux.HandleFunc("GET /api/v1/metrics/summary", api.getMetrics)
-	mux.HandleFunc("GET /api/v1/tasks", api.listTasks)
-	mux.HandleFunc("POST /api/v1/tasks", api.createTask)
-	mux.HandleFunc("GET /api/v1/tasks/{task_id}", api.getTask)
-	mux.HandleFunc("DELETE /api/v1/tasks/{task_id}", api.deleteTask)
-	mux.HandleFunc("POST /api/v1/tasks/{task_id}/cancel", api.cancelTask)
-	mux.HandleFunc("POST /api/v1/executions/{execution_id}/retry", api.retryExecution)
+	mux.HandleFunc("GET /api/v1/routines", api.listRoutines)
+	mux.HandleFunc("POST /api/v1/routines", api.createRoutine)
+	mux.HandleFunc("GET /api/v1/routines/{routine_id}", api.getRoutine)
+	mux.HandleFunc("PUT /api/v1/routines/{routine_id}", api.updateRoutine)
+	mux.HandleFunc("PUT /api/v1/routines/{routine_id}/archived", api.setRoutineArchived)
+	mux.HandleFunc("POST /api/v1/routines/{routine_id}/run", api.runRoutine)
+	mux.HandleFunc("POST /api/v1/routines/{routine_id}/discard-occurrence", api.discardRoutineOccurrence)
+	mux.HandleFunc("GET /api/v1/work", api.listWork)
+	mux.HandleFunc("GET /api/v1/work/{work_id}", api.getWork)
+	mux.HandleFunc("POST /api/v1/work/{work_id}/cancel", api.cancelWork)
+	mux.HandleFunc("POST /api/v1/work/{work_id}/targets/{target_id}/cancel", api.cancelWorkTarget)
+	mux.HandleFunc("POST /api/v1/work/{work_id}/targets/{target_id}/retry", api.retryWorkTarget)
+	mux.HandleFunc("GET /api/v1/overview", api.getOverview)
 	mux.HandleFunc("GET /api/v1/attempts/{attempt_id}", api.getAttempt)
 	mux.HandleFunc("POST /api/v1/attempts/{attempt_id}/start", api.startAttempt)
 	mux.HandleFunc("PUT /api/v1/attempts/{attempt_id}/heartbeat", api.heartbeat)
 	mux.HandleFunc("GET /api/v1/attempts/{attempt_id}/events", api.getEvents)
 	mux.HandleFunc("POST /api/v1/attempts/{attempt_id}/events", api.appendEvents)
 	mux.HandleFunc("POST /api/v1/attempts/{attempt_id}/complete", api.completeAttempt)
-	return api.requestLog(mux)
+	return api.requestLog(mux, true)
 }
 
-func (a *API) getMetrics(w http.ResponseWriter, r *http.Request) {
-	if len(r.URL.Query()["window"]) > 1 {
-		writeError(w, invalid("invalid_window", "window may be provided once"))
+// NewRemoteWorkerHandler exposes only the Worker lifecycle over the optional
+// TLS listener. Operator, repository, Routine, and Work APIs remain local.
+func NewRemoteWorkerHandler(store *Store, logger *slog.Logger) http.Handler {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	api := &API{store: store, logger: logger}
+	mux := http.NewServeMux()
+	mux.Handle("GET /healthz", api.requireTLS(http.HandlerFunc(api.health)))
+	mux.Handle("POST /api/v1/worker-enrollments/exchange", api.requireTLS(http.HandlerFunc(api.exchangeWorkerEnrollment)))
+	mux.Handle("PUT /api/v1/workers/{worker_id}", api.remoteWorkerAuth(http.HandlerFunc(api.registerWorker)))
+	mux.Handle("PUT /api/v1/workers/{worker_id}/heartbeat", api.remoteWorkerAuth(http.HandlerFunc(api.heartbeatWorker)))
+	mux.Handle("POST /api/v1/workers/{worker_id}/claims", api.remoteWorkerAuth(http.HandlerFunc(api.claim)))
+	mux.Handle("GET /api/v1/attempts/{attempt_id}", api.remoteAttemptAuth(http.HandlerFunc(api.getAttempt)))
+	mux.Handle("POST /api/v1/attempts/{attempt_id}/start", api.remoteAttemptAuth(http.HandlerFunc(api.startAttempt)))
+	mux.Handle("PUT /api/v1/attempts/{attempt_id}/heartbeat", api.remoteAttemptAuth(http.HandlerFunc(api.heartbeat)))
+	mux.Handle("POST /api/v1/attempts/{attempt_id}/events", api.remoteAttemptAuth(http.HandlerFunc(api.appendEvents)))
+	mux.Handle("POST /api/v1/attempts/{attempt_id}/complete", api.remoteAttemptAuth(http.HandlerFunc(api.completeAttempt)))
+	return api.requestLog(mux, false)
+}
+
+func (a *API) createWorkerEnrollment(w http.ResponseWriter, r *http.Request) {
+	if !prepareMutation(w, r, protocol.MaxBodyBytes) {
 		return
 	}
-	summary, err := a.store.Metrics(r.Context(), r.URL.Query().Get("window"))
+	var input protocol.CreateWorkerEnrollmentRequest
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	enrollment, err := a.store.CreateWorkerEnrollment(r.Context(), input.WorkerID)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, summary)
+	writeJSON(w, http.StatusCreated, enrollment)
+}
+
+func (a *API) exchangeWorkerEnrollment(w http.ResponseWriter, r *http.Request) {
+	if !prepareMutation(w, r, protocol.MaxBodyBytes) {
+		return
+	}
+	var input protocol.ExchangeWorkerEnrollmentRequest
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	credential, err := a.store.ExchangeWorkerEnrollment(r.Context(), input.WorkerID, input.EnrollmentToken, input.Credential)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, credential)
+}
+
+func (a *API) requireTLS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil {
+			writeError(w, &ServiceError{Code: "tls_required", Message: "the remote Worker API requires TLS", Status: http.StatusUpgradeRequired})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *API) authenticateRemoteWorker(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if r.TLS == nil {
+		writeError(w, &ServiceError{Code: "tls_required", Message: "the remote Worker API requires TLS", Status: http.StatusUpgradeRequired})
+		return "", false
+	}
+	parts := strings.Fields(r.Header.Get("Authorization"))
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeError(w, unauthorizedWorker())
+		return "", false
+	}
+	workerID, err := a.store.AuthenticateWorkerCredential(r.Context(), parts[1])
+	if err != nil {
+		var service *ServiceError
+		if errors.As(err, &service) && service.Status == http.StatusUnauthorized {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+		}
+		writeError(w, err)
+		return "", false
+	}
+	return workerID, true
+}
+
+func (a *API) remoteWorkerAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		workerID, ok := a.authenticateRemoteWorker(w, r)
+		if !ok {
+			return
+		}
+		if workerID != r.PathValue("worker_id") {
+			writeError(w, &ServiceError{Code: "worker_forbidden", Message: "Worker credential does not own this resource", Status: http.StatusForbidden})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *API) remoteAttemptAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		workerID, ok := a.authenticateRemoteWorker(w, r)
+		if !ok {
+			return
+		}
+		attempt, err := a.store.Attempt(r.Context(), r.PathValue("attempt_id"))
+		if err != nil || attempt.WorkerID != workerID {
+			if err != nil && !errors.Is(err, ErrNotFound) {
+				writeError(w, err)
+				return
+			}
+			writeError(w, &ServiceError{Code: "worker_forbidden", Message: "Worker credential does not own this resource", Status: http.StatusForbidden})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 type responseRecorder struct {
@@ -124,7 +243,7 @@ func (w *responseRecorder) Write(body []byte) (int, error) {
 	return w.ResponseWriter.Write(body)
 }
 
-func (a *API) requestLog(next http.Handler) http.Handler {
+func (a *API) requestLog(next http.Handler, requireLoopbackHost bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID, err := newID()
 		if err != nil {
@@ -133,7 +252,7 @@ func (a *API) requestLog(next http.Handler) http.Handler {
 		w.Header().Set("X-Request-ID", requestID)
 		recorder := &responseRecorder{ResponseWriter: w}
 		start := time.Now()
-		if err := validateRequestHost(r.Host); err != nil {
+		if err := validateRequestHost(r.Host); requireLoopbackHost && err != nil {
 			writeError(recorder, &ServiceError{Code: "invalid_host", Message: "Host must identify a loopback address", Status: 403})
 		} else {
 			next.ServeHTTP(recorder, r)
@@ -195,9 +314,21 @@ func (a *API) registerWorker(w http.ResponseWriter, r *http.Request) {
 			CodexVersion: worker.RuntimeVersion, Capacity: worker.Capacity,
 			ActiveCount: worker.ActiveCount, Health: worker.Health, Online: worker.Online,
 			Repositories: worker.Repositories, RetainedWorktrees: worker.RetainedWorktrees,
-			CurrentTaskTitle: worker.CurrentTaskTitle, RegisteredAt: worker.RegisteredAt,
+			CurrentWorkTitle: worker.CurrentWorkTitle, RegisteredAt: worker.RegisteredAt,
 			LastHeartbeat: worker.LastHeartbeat,
 		})
+		return
+	}
+	writeJSON(w, http.StatusOK, worker)
+}
+
+func (a *API) heartbeatWorker(w http.ResponseWriter, r *http.Request) {
+	if !prepareMutation(w, r, protocol.MaxBodyBytes) || !decodeEmptyJSON(w, r) {
+		return
+	}
+	worker, err := a.store.HeartbeatWorker(r.Context(), r.PathValue("worker_id"))
+	if err != nil {
+		writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, worker)
@@ -242,6 +373,73 @@ func (a *API) getWorker(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, worker)
 }
 
+func (a *API) testWorkerConnection(w http.ResponseWriter, r *http.Request) {
+	if !prepareMutation(w, r, protocol.MaxBodyBytes) || !decodeEmptyJSON(w, r) {
+		return
+	}
+	worker, err := a.store.Worker(r.Context(), r.PathValue("worker_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	testContext, cancel := context.WithTimeout(r.Context(), workerConnectionTimeout)
+	defer cancel()
+	worker, err = waitForWorkerRegistration(
+		testContext, a.store, worker.ID, worker.LastHeartbeat, 100*time.Millisecond,
+	)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, worker)
+}
+
+func waitForWorkerRegistration(
+	ctx context.Context,
+	store *Store,
+	workerID string,
+	previousHeartbeat time.Time,
+	pollInterval time.Duration,
+) (protocol.Worker, error) {
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return protocol.Worker{}, workerConnectionError(ctx.Err())
+		case <-ticker.C:
+			worker, err := store.Worker(ctx, workerID)
+			if err != nil {
+				if ctx.Err() != nil {
+					return protocol.Worker{}, workerConnectionError(ctx.Err())
+				}
+				return protocol.Worker{}, err
+			}
+			if worker.LastHeartbeat.After(previousHeartbeat) {
+				return worker, nil
+			}
+		}
+	}
+}
+
+func workerConnectionError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &ServiceError{
+			Code: "worker_connection_timeout", Message: "Worker did not send a fresh registration", Status: http.StatusGatewayTimeout,
+		}
+	}
+	return unavailable(err)
+}
+
+func (a *API) getWorkerRepositoryOptions(w http.ResponseWriter, r *http.Request) {
+	options, err := a.store.WorkerRepositoryOptions(r.Context(), r.PathValue("worker_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"repositories": options})
+}
+
 func (a *API) listManagedRepositories(w http.ResponseWriter, r *http.Request) {
 	repositories, err := a.store.ManagedRepositories(r.Context())
 	if err != nil {
@@ -280,6 +478,17 @@ func (a *API) getManagedRepository(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, repository)
 }
 
+func (a *API) getManagedRepositoryReadiness(w http.ResponseWriter, r *http.Request) {
+	readiness, err := a.store.ManagedRepositoryReadiness(
+		r.Context(), r.PathValue("repository_id"),
+	)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, readiness)
+}
+
 func (a *API) setManagedRepositoryEnabled(w http.ResponseWriter, r *http.Request) {
 	if !prepareMutation(w, r, protocol.MaxBodyBytes) {
 		return
@@ -304,113 +513,6 @@ func (a *API) setManagedRepositoryEnabled(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, repository)
-}
-
-func (a *API) listTasks(w http.ResponseWriter, r *http.Request) {
-	limit, err := pageLimit(r, protocol.DefaultTaskPageSize, protocol.MaxTaskPageSize)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	cursor, err := decodeTaskCursor(r.URL.Query().Get("cursor"))
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	page, err := a.store.Tasks(r.Context(), protocol.TaskPageRequest{Limit: limit, Cursor: cursor})
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	var nextCursor *string
-	if page.NextCursor != nil {
-		encoded, err := encodeTaskCursor(*page.NextCursor)
-		if err != nil {
-			writeError(w, unavailable(err))
-			return
-		}
-		nextCursor = &encoded
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"tasks": page.Tasks, "next_cursor": nextCursor})
-}
-
-func (a *API) createTask(w http.ResponseWriter, r *http.Request) {
-	if !prepareMutation(w, r, protocol.MaxBodyBytes) {
-		return
-	}
-	var input protocol.CreateTaskRequest
-	if !decodeJSON(w, r, &input) {
-		return
-	}
-	task, created, err := a.store.CreateTask(r.Context(), input)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	status := http.StatusOK
-	if created {
-		status = http.StatusCreated
-		a.logStateChange("execution", task.Execution.ID, task.Execution.State, "task_id", task.Task.ID)
-	}
-	writeJSON(w, status, task)
-}
-
-func (a *API) getTask(w http.ResponseWriter, r *http.Request) {
-	task, err := a.store.Task(r.Context(), r.PathValue("task_id"))
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, task)
-}
-
-func (a *API) deleteTask(w http.ResponseWriter, r *http.Request) {
-	if !prepareMutation(w, r, protocol.MaxBodyBytes) {
-		return
-	}
-	if !decodeEmptyJSON(w, r) {
-		return
-	}
-	taskID := r.PathValue("task_id")
-	if err := a.store.DeleteTask(r.Context(), taskID); err != nil {
-		writeError(w, err)
-		return
-	}
-	a.logger.Info("task_history_deleted", "task_id", taskID)
-	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
-}
-
-func (a *API) cancelTask(w http.ResponseWriter, r *http.Request) {
-	if !prepareMutation(w, r, protocol.MaxBodyBytes) {
-		return
-	}
-	if !decodeEmptyJSON(w, r) {
-		return
-	}
-	task, err := a.store.CancelTask(r.Context(), r.PathValue("task_id"))
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	a.logStateChange("execution", task.Execution.ID, task.Execution.State,
-		"task_id", task.Task.ID, "cancellation_requested", task.Execution.CancellationRequested)
-	writeJSON(w, http.StatusOK, task)
-}
-
-func (a *API) retryExecution(w http.ResponseWriter, r *http.Request) {
-	if !prepareMutation(w, r, protocol.MaxBodyBytes) {
-		return
-	}
-	if !decodeEmptyJSON(w, r) {
-		return
-	}
-	task, err := a.store.RetryExecution(r.Context(), r.PathValue("execution_id"))
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	a.logStateChange("execution", task.Execution.ID, task.Execution.State, "task_id", task.Task.ID)
-	writeJSON(w, http.StatusOK, task)
 }
 
 func (a *API) getAttempt(w http.ResponseWriter, r *http.Request) {
@@ -514,40 +616,6 @@ func pageLimit(r *http.Request, defaultLimit, maxLimit int) (int, error) {
 		return 0, invalid("invalid_limit", fmt.Sprintf("limit must be an integer between 1 and %d", maxLimit))
 	}
 	return limit, nil
-}
-
-func decodeTaskCursor(raw string) (*protocol.TaskCursor, error) {
-	if raw == "" {
-		return nil, nil
-	}
-	encoded, err := base64.RawURLEncoding.DecodeString(raw)
-	if err != nil {
-		return nil, invalid("invalid_cursor", "cursor is invalid")
-	}
-	var value struct {
-		CreatedAtMillis int64  `json:"created_at"`
-		ID              string `json:"id"`
-	}
-	decoder := json.NewDecoder(strings.NewReader(string(encoded)))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&value); err != nil || value.CreatedAtMillis < 0 || value.ID == "" || len(value.ID) > 200 {
-		return nil, invalid("invalid_cursor", "cursor is invalid")
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return nil, invalid("invalid_cursor", "cursor is invalid")
-	}
-	return &protocol.TaskCursor{CreatedAtMillis: value.CreatedAtMillis, ID: value.ID}, nil
-}
-
-func encodeTaskCursor(cursor protocol.TaskCursor) (string, error) {
-	value, err := json.Marshal(struct {
-		CreatedAtMillis int64  `json:"created_at"`
-		ID              string `json:"id"`
-	}{CreatedAtMillis: cursor.CreatedAtMillis, ID: cursor.ID})
-	if err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(value), nil
 }
 
 func (a *API) completeAttempt(w http.ResponseWriter, r *http.Request) {

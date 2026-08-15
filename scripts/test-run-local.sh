@@ -9,8 +9,25 @@ mkdir -p "$temporary/bin"
 
 cat >"$temporary/bin/factory-server" <<'EOF'
 #!/bin/sh
+resolved_listen() {
+  config=${FACTORY_SERVER_CONFIG:-${FACTORY_DATA_HOME:?}/config.toml}
+  if [ -f "$config" ]; then
+    sed -n 's/^[[:space:]]*listen[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "$config" | head -1
+  else
+    echo "127.0.0.1:7337"
+  fi
+}
+if [ "${1:-}" = "-print-listen" ]; then
+  resolved_listen
+  exit 0
+fi
 if [ -n "${FACTORY_TEST_SERVER_PID_FILE:-}" ]; then
   echo "$$" >"$FACTORY_TEST_SERVER_PID_FILE"
+fi
+if [ "${1:-}" = "-listen" ]; then
+  listen=$2
+else
+  listen=$(resolved_listen)
 fi
 exec node -e '
   const { existsSync } = require("node:fs");
@@ -29,8 +46,17 @@ exec node -e '
       setTimeout(() => process.exit(0), 3000);
       return;
     }
+    const registered = existsSync(process.env.FACTORY_TEST_WORKER_MARKER);
+    if (request.url === "/api/v1/workers/new-unhealthy-worker") {
+      response.end(JSON.stringify({
+        id:"new-unhealthy-worker",
+        health:registered && process.env.FACTORY_TEST_HEALTHY_WORKER ? "healthy" : "unhealthy",
+        online:registered
+      }));
+      return;
+    }
     const workers = [{id:"existing-healthy-worker",health:"healthy",online:true}];
-    if (existsSync(process.env.FACTORY_TEST_WORKER_MARKER)) {
+    if (registered) {
       workers.push({
         id:"new-unhealthy-worker",
         health:process.env.FACTORY_TEST_HEALTHY_WORKER ? "healthy" : "unhealthy",
@@ -39,7 +65,7 @@ exec node -e '
     }
     response.end(JSON.stringify({workers}));
   }).listen(port, "127.0.0.1");
-' "$2"
+' "$listen"
 EOF
 
 cat >"$temporary/bin/factory-worker" <<'EOF'
@@ -161,7 +187,7 @@ if [ "$status" -ne 1 ] ||
 fi
 
 node - "$root" "$temporary" "$temporary/worker.toml" <<'EOF'
-const { existsSync, readFileSync, rmSync } = require("node:fs");
+const { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } = require("node:fs");
 const { createServer } = require("node:net");
 const { spawn } = require("node:child_process");
 const { join } = require("node:path");
@@ -225,7 +251,13 @@ async function verifySignal(signal, suffix, listenVariable) {
   delete environment.FACTORY_V2_LISTEN;
   delete environment.FACTORY_SKIP_BUILD;
   delete environment.FACTORY_V2_SKIP_BUILD;
-  environment[listenVariable] = `127.0.0.1:${port}`;
+  if (listenVariable === "config.toml") {
+    mkdirSync(environment.FACTORY_DATA_HOME, { recursive: true });
+    writeFileSync(join(environment.FACTORY_DATA_HOME, "config.toml"), `listen = "127.0.0.1:${port}"\n`);
+    environment.FACTORY_SKIP_BUILD = "1";
+  } else {
+    environment[listenVariable] = `127.0.0.1:${port}`;
+  }
   if (listenVariable === "FACTORY_LISTEN") {
     environment.FACTORY_V2_LISTEN = "127.0.0.1:1";
     environment.FACTORY_SKIP_BUILD = "1";
@@ -287,10 +319,11 @@ async function verifySignal(signal, suffix, listenVariable) {
 (async () => {
   await verifySignal("SIGTERM", "term", "FACTORY_LISTEN");
   await verifySignal("SIGINT", "int", "FACTORY_V2_LISTEN");
+  await verifySignal("SIGTERM", "config", "config.toml");
 })().catch((error) => {
   console.error(error.message);
   process.exitCode = 1;
 });
 EOF
 
-echo "Factory launcher rejects unhealthy workers, retired-state writes, server loss, and stalled readiness responses; signals stop cleanly."
+echo "Factory launcher honors bootstrap listen settings, rejects unhealthy workers, retired-state writes, server loss, and stalled readiness responses; signals stop cleanly."

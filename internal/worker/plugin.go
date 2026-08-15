@@ -175,6 +175,16 @@ func pluginIdentities(plugins []Plugin) []string {
 	return identities
 }
 
+func pluginsForRuntime(plugins []Plugin, runtime string) []Plugin {
+	selected := make([]Plugin, 0, len(plugins))
+	for _, plugin := range plugins {
+		if plugin.Runtime == runtime {
+			selected = append(selected, plugin)
+		}
+	}
+	return selected
+}
+
 func checkPluginDependencies(plugins []Plugin, lookup commandLookup) error {
 	if lookup == nil {
 		lookup = exec.LookPath
@@ -282,8 +292,12 @@ func verifyInstalledReviewerAssetClosure(codexHome string, plugin Plugin) error 
 	if len(plugin.ReviewerAssets) == 0 {
 		return nil
 	}
-	root := filepath.Join(codexHome, "reviewer-skills", plugin.ID)
-	if _, err := resolveSecureDirectory(codexHome, root, "installed reviewer asset root"); err != nil {
+	trustedHome, err := secureDirectory(codexHome, "Codex home")
+	if err != nil {
+		return err
+	}
+	root := filepath.Join(trustedHome, "reviewer-skills", plugin.ID)
+	if _, err := resolveSecureDirectory(trustedHome, root, "installed reviewer asset root"); err != nil {
 		return err
 	}
 	expected := make(map[string]bool, len(plugin.ReviewerAssets))
@@ -291,7 +305,7 @@ func verifyInstalledReviewerAssetClosure(codexHome string, plugin Plugin) error 
 		expected[filepath.ToSlash(strings.TrimPrefix(asset.RelativePath, "reviewer-skills/"))] = true
 	}
 	actual := make(map[string]bool, len(expected))
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}

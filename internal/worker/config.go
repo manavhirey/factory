@@ -17,18 +17,22 @@ import (
 
 const (
 	defaultServer        = "http://127.0.0.1:7337"
-	defaultMaxConcurrent = 1
-	maxConcurrent        = 4
+	defaultMaxConcurrent = 10
 )
 
 type RepositoryConfig struct {
-	Path string `toml:"path"`
+	Path       string `toml:"path"`
+	BaseBranch string `toml:"base_branch"`
 }
 
 type Config struct {
 	Server                  string                      `toml:"server"`
 	Name                    string                      `toml:"name"`
+	Labels                  map[string]string           `toml:"labels"`
+	EnrollmentToken         string                      `toml:"enrollment_token"`
+	CACertificate           string                      `toml:"ca_certificate"`
 	Runtime                 string                      `toml:"runtime"`
+	Runtimes                []string                    `toml:"runtimes"`
 	MaxConcurrent           int                         `toml:"max_concurrent"`
 	DataDirectory           string                      `toml:"data_directory"`
 	SourceAccess            []string                    `toml:"source_access"`
@@ -40,10 +44,12 @@ type Config struct {
 }
 
 type Repository struct {
-	Key            string
-	Path           string
-	RemoteIdentity string
-	BaseCommit     string
+	Key             string
+	Path            string
+	RemoteIdentity  string
+	BaseCommit      string
+	BaseBranch      string
+	coordinationKey string
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -63,19 +69,37 @@ func LoadConfig(path string) (Config, error) {
 	if config.Server == "" {
 		config.Server = defaultServer
 	}
+	config.Runtime = strings.ToLower(strings.TrimSpace(config.Runtime))
+	config.EnrollmentToken = strings.TrimSpace(config.EnrollmentToken)
+	config.CACertificate = strings.TrimSpace(config.CACertificate)
+	if config.CACertificate != "" && !filepath.IsAbs(config.CACertificate) {
+		config.CACertificate = filepath.Join(filepath.Dir(path), config.CACertificate)
+	}
+	for index := range config.Runtimes {
+		config.Runtimes[index] = strings.ToLower(strings.TrimSpace(config.Runtimes[index]))
+	}
 	if config.Runtime == "" {
 		config.Runtime = protocol.RuntimeCodex
 	}
-	if config.MaxConcurrent == 0 {
+	config.Runtimes = configuredRuntimes(config)
+	if !metadata.IsDefined("max_concurrent") {
 		config.MaxConcurrent = defaultMaxConcurrent
 	}
-	if config.DataDirectory == "" {
-		return Config{}, errors.New("data_directory is required")
+	config.path, err = filepath.Abs(path)
+	if err != nil {
+		return Config{}, fmt.Errorf("resolve worker configuration path: %w", err)
+	}
+	dataDirectoryDefaulted := !metadata.IsDefined("data_directory")
+	if dataDirectoryDefaulted {
+		config.DataDirectory, err = defaultDataDirectory(config.path)
+		if err != nil {
+			return Config{}, err
+		}
 	}
 	for index := range config.SourceAccess {
 		config.SourceAccess[index] = strings.ToLower(strings.TrimSpace(config.SourceAccess[index]))
 	}
-	if !filepath.IsAbs(config.DataDirectory) {
+	if !dataDirectoryDefaulted && strings.TrimSpace(config.DataDirectory) != "" && !filepath.IsAbs(config.DataDirectory) {
 		config.DataDirectory = filepath.Join(filepath.Dir(path), config.DataDirectory)
 	}
 	for key, repository := range config.Repositories {
@@ -84,25 +108,64 @@ func LoadConfig(path string) (Config, error) {
 			config.Repositories[key] = repository
 		}
 	}
-	config.path, err = filepath.Abs(path)
-	if err != nil {
-		return Config{}, fmt.Errorf("resolve worker configuration path: %w", err)
-	}
 	return config, validateConfig(config)
+}
+
+func defaultDataDirectory(configPath string) (string, error) {
+	base := strings.TrimSuffix(filepath.Base(configPath), ".toml")
+	if strings.TrimSpace(base) == "" || base == "." || base == ".." {
+		return "", errors.New("derive data_directory: worker configuration filename has no usable basename after removing .toml")
+	}
+	return filepath.Join(filepath.Dir(configPath), "workers", base), nil
 }
 
 func validateConfig(config Config) error {
 	if err := validateServerURL(config.Server); err != nil {
 		return err
 	}
+	remote := strings.HasPrefix(config.Server, "https://")
+	if !remote && (config.EnrollmentToken != "" || config.CACertificate != "") {
+		return errors.New("enrollment_token and ca_certificate require a remote HTTPS server")
+	}
+	if config.EnrollmentToken != "" && (len(config.EnrollmentToken) < 32 || len(config.EnrollmentToken) > 1024) {
+		return errors.New("enrollment_token must contain between 32 and 1024 bytes")
+	}
 	if strings.TrimSpace(config.Name) == "" || len(config.Name) > 200 {
 		return errors.New("name is required and must be at most 200 bytes")
 	}
-	if config.Runtime != "" && !protocol.SupportedRuntime(config.Runtime) {
-		return errors.New("runtime must be codex or claude-code")
+	if len(config.Labels) > 20 {
+		return errors.New("labels may contain at most 20 entries")
 	}
-	if config.MaxConcurrent < 1 || config.MaxConcurrent > maxConcurrent {
-		return fmt.Errorf("max_concurrent must be between 1 and %d", maxConcurrent)
+	for key, value := range config.Labels {
+		if strings.TrimSpace(key) == "" || key != strings.TrimSpace(key) || len(key) > 100 || len(strings.TrimSpace(value)) > 200 {
+			return errors.New("label keys must be trimmed and at most 100 bytes; values must be at most 200 bytes")
+		}
+	}
+	primaryRuntime := config.Runtime
+	if primaryRuntime == "" {
+		primaryRuntime = configuredRuntimes(config)[0]
+	}
+	if !protocol.SupportedRuntime(primaryRuntime) {
+		return errors.New("runtime must be pi, codex, or claude-code")
+	}
+	seenRuntimes := make(map[string]bool, len(config.Runtimes))
+	primaryFound := false
+	for _, runtime := range configuredRuntimes(config) {
+		if !protocol.SupportedRuntime(runtime) {
+			return errors.New("runtimes may contain only pi, codex, or claude-code")
+		}
+		if seenRuntimes[runtime] {
+			return fmt.Errorf("runtime %q is duplicated", runtime)
+		}
+		seenRuntimes[runtime] = true
+		primaryFound = primaryFound || runtime == primaryRuntime
+	}
+	if !primaryFound {
+		return errors.New("runtime must also appear in runtimes when both fields are set")
+	}
+	if config.MaxConcurrent < protocol.MinWorkerCapacity || config.MaxConcurrent > protocol.MaxWorkerCapacity {
+		return fmt.Errorf("max_concurrent must be between %d and %d",
+			protocol.MinWorkerCapacity, protocol.MaxWorkerCapacity)
 	}
 	if strings.TrimSpace(config.DataDirectory) == "" {
 		return errors.New("data_directory is required")
@@ -143,8 +206,24 @@ func validateConfig(config Config) error {
 		if strings.TrimSpace(repository.Path) == "" {
 			return fmt.Errorf("repository %q path is required", key)
 		}
+		if repository.BaseBranch != strings.TrimSpace(repository.BaseBranch) {
+			return fmt.Errorf("repository %q base_branch must not have surrounding whitespace", key)
+		}
+		if len(repository.BaseBranch) > 244 {
+			return fmt.Errorf("repository %q base_branch must be at most 244 bytes", key)
+		}
 	}
 	return nil
+}
+
+func configuredRuntimes(config Config) []string {
+	if len(config.Runtimes) != 0 {
+		return append([]string(nil), config.Runtimes...)
+	}
+	if config.Runtime != "" {
+		return []string{config.Runtime}
+	}
+	return []string{protocol.RuntimeCodex}
 }
 
 func validateServerURL(value string) error {
@@ -152,15 +231,18 @@ func validateServerURL(value string) error {
 	if err != nil {
 		return fmt.Errorf("parse server URL: %w", err)
 	}
-	if parsed.Scheme != "http" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return errors.New("server must be a plain loopback HTTP URL without credentials, query, or fragment")
+	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("server must be an HTTP or HTTPS URL without credentials, query, or fragment")
 	}
 	if parsed.Path != "" && parsed.Path != "/" {
 		return errors.New("server URL must not contain a path")
 	}
 	host := parsed.Hostname()
 	if host == "" || parsed.Port() == "" {
-		return errors.New("server URL must include a loopback host and port")
+		return errors.New("server URL must include a host and port")
+	}
+	if parsed.Scheme == "https" {
+		return nil
 	}
 	if ip := net.ParseIP(host); ip != nil {
 		if !ip.IsLoopback() {

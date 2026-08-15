@@ -1,616 +1,88 @@
-import {
-  expect,
-  request,
-  test,
-  type APIRequestContext,
-  type Page,
-} from "@playwright/test";
+import { expect, test } from "@playwright/test";
 
 test.describe.configure({ mode: "serial" });
 test.setTimeout(120_000);
 
-const workerOnline = "worker-online-e2e";
-const workerOffline = "worker-offline-e2e";
-const realWorker = "11111111-1111-4111-8111-111111111111";
-const onlineRepositories = [
-  { key: "factory", remote_identity: "github.com/example/factory", retained_count: 1 },
-  { key: "handbook", remote_identity: "github.com/example/handbook", retained_count: 0 },
-];
-const offlineRepositories = [
-  { key: "archive", remote_identity: "github.com/example/archive", retained_count: 0 },
-];
-const identifiers: Record<string, string> = {};
+const routineName = "E2E repository review";
 
-interface TaskDetail {
-  task: { id: string; title: string; state?: string };
-  execution: { id: string };
-  repository: { id: string };
-  attempts: Array<{ id: string; state?: string; result?: string; error?: string }>;
-}
-
-async function json<T>(response: Awaited<ReturnType<APIRequestContext["get"]>>): Promise<T> {
-  if (!response.ok()) {
-    throw new Error(`API ${response.status()}: ${await response.text()}`);
-  }
-  return response.json() as Promise<T>;
-}
-
-async function registerWorker(
-  api: APIRequestContext,
-  id: string,
-  name: string,
-  repositories: typeof onlineRepositories,
-  activeCount = 0,
-  disposedAttemptIDs: string[] = [],
-  runtime: "codex" | "claude-code" = "codex",
-) {
-  return json<{
-    repositories: Array<{ id: string; key: string }>;
-  }>(
-    await api.put(`/api/v1/workers/${id}`, {
-      data: {
-        name,
-        worker_version: "2.0.0-test",
-        runtime,
-        runtime_version: runtime === "claude-code" ? "2.1.220-test" : "0.42.0-test",
-        capacity: 2,
-        active_count: activeCount,
-        health: "healthy",
-        capacity_handoff_version: 1,
-        disposed_attempt_ids: disposedAttemptIDs,
-        repositories,
-        retained_worktrees:
-          id === workerOnline
-            ? [
-                {
-                  attempt_id: "attempt-retained-001",
-                  repository_id: identifiers.factoryRepository ?? "",
-                  path: "/tmp/factory-e2e/worktrees/attempt-retained-001",
-                  reason: "failed with local changes",
-                  cleanup_command: "factory-worker cleanup attempt-retained-001 --confirm",
-                },
-              ]
-            : [],
-      },
-    }),
-  );
-}
-
-async function createTask(
-  api: APIRequestContext,
-  key: string,
-  title: string,
-  workerID: string,
-  repositoryID: string,
-  description = "A representative task created through the real control-plane API.",
-) {
-  return json<TaskDetail>(
-    await api.post("/api/v1/tasks", {
-      data: {
-        request_key: key,
-        title,
-        description,
-        worker_id: workerID,
-        repository_id: repositoryID,
-        timeout_seconds: 7200,
-      },
-    }),
-  );
-}
-
-async function claimAndStart(api: APIRequestContext, requestID: string) {
-  const token = `lease-token-${requestID}-0123456789abcdef0123456789`;
-  const claim = await json<{
-    attempt: { id: string };
-    execution: { id: string };
-    task: { id: string };
-  }>(
-    await api.post(`/api/v1/workers/${workerOnline}/claims`, {
-      data: { request_id: requestID, lease_token: token },
-    }),
-  );
-  await json(
-    await api.post(`/api/v1/attempts/${claim.attempt.id}/start`, {
-      data: { lease_token: token, process_identity: `e2e-${requestID}` },
-    }),
-  );
-  return { ...claim, token };
-}
-
-async function complete(
-  api: APIRequestContext,
-  requestID: string,
-  state: "succeeded" | "failed",
-  result: string,
-) {
-  const claim = await claimAndStart(api, requestID);
-  await json(
-    await api.post(`/api/v1/attempts/${claim.attempt.id}/complete`, {
-      data: {
-        lease_token: claim.token,
-        state,
-        ...(state === "succeeded" ? { result } : { error: result }),
-      },
-    }),
-  );
-  return claim;
-}
-
-async function waitForRealWorker(api: APIRequestContext) {
-  for (let attempt = 0; attempt < 60; attempt += 1) {
-    const response = await api.get("/api/v1/workers");
-    if (response.ok()) {
-      const body = (await response.json()) as {
-        workers: Array<{
-          id: string;
-          health: string;
-          online: boolean;
-          repositories: Array<{ id: string; key: string }>;
-        }> | null;
-      };
-      const worker = body.workers?.find((candidate) => candidate.id === realWorker);
-      if (worker?.online && worker.health === "healthy") return worker;
-    }
-    await new Promise((resolveWait) => setTimeout(resolveWait, 500));
-  }
-  throw new Error("real Factory worker did not register as healthy within 30 seconds");
-}
-
-function observeBrowser(page: Page) {
-  const problems: string[] = [];
-  const realtime: string[] = [];
-  page.on("console", (message) => {
-    if (message.type() === "error") problems.push(`console: ${message.text()}`);
-  });
-  page.on("requestfailed", (failed) => {
-    problems.push(`request: ${failed.url()} ${failed.failure()?.errorText ?? "failed"}`);
-  });
-  page.on("websocket", (socket) => realtime.push(`websocket: ${socket.url()}`));
-  page.on("response", (response) => {
-    if (response.headers()["content-type"]?.includes("text/event-stream")) {
-      realtime.push(`event-stream: ${response.url()}`);
-    }
-  });
-  return {
-    assertClean() {
-      expect(problems, "browser console and network failures").toEqual([]);
-      expect(realtime, "the UI must use HTTP polling only").toEqual([]);
-    },
-  };
-}
-
-test.beforeAll(async () => {
-  const api = await request.newContext({ baseURL: "http://127.0.0.1:17437" });
-  const real = await waitForRealWorker(api);
-  identifiers.realFactoryRepository = real.repositories.find(
-    (repository) => repository.key === "factory-demo",
-  )!.id;
-  identifiers.realHandbookRepository = real.repositories.find(
-    (repository) => repository.key === "handbook-demo",
-  )!.id;
-
-  const offline = await registerWorker(
-    api,
-    workerOffline,
-    "Archive Mac",
-    offlineRepositories,
-    0,
-    [],
-    "claude-code",
-  );
-  identifiers.offlineRepository = offline.repositories[0].id;
-
-  // Registrations become offline after the server's documented 30 second window.
-  await new Promise((resolveWait) => setTimeout(resolveWait, 31_000));
-
-  const online = await registerWorker(api, workerOnline, "Build Mac", onlineRepositories);
-  identifiers.factoryRepository = online.repositories.find((repo) => repo.key === "factory")!.id;
-  identifiers.handbookRepository = online.repositories.find((repo) => repo.key === "handbook")!.id;
-
-  const queued = await createTask(
-    api,
-    "e2e-queued",
-    "Queued for the offline archive worker",
-    workerOffline,
-    identifiers.offlineRepository,
-  );
-  identifiers.queuedTask = queued.task.id;
-
-  const cancelled = await createTask(
-    api,
-    "e2e-cancelled",
-    "Cancelled queue cleanup",
-    workerOffline,
-    identifiers.offlineRepository,
-  );
-  await json(await api.post(`/api/v1/tasks/${cancelled.task.id}/cancel`, { data: {} }));
-
-  const succeeded = await createTask(
-    api,
-    "e2e-succeeded",
-    "Ship the stable API client",
-    workerOnline,
-    identifiers.factoryRepository,
-  );
-  const succeededAttempt = await complete(
-    api,
-    "claim-succeeded",
-    "succeeded",
-    "API client shipped with all checks passing.",
-  );
-  identifiers.succeededTask = succeeded.task.id;
-
-  const failed = await createTask(
-    api,
-    "e2e-failed",
-    "Repair a failed release check",
-    workerOnline,
-    identifiers.factoryRepository,
-  );
-  const failedAttempt = await complete(
-    api,
-    "claim-failed",
-    "failed",
-    "The release check found a deterministic failure.",
-  );
-  identifiers.failedTask = failed.task.id;
-
-  const longTitle = `Long operational title ${"with bounded content ".repeat(8)}`.slice(0, 200);
-  const longTask = await createTask(
-    api,
-    "e2e-long",
-    longTitle,
-    workerOffline,
-    identifiers.offlineRepository,
-    `${"Long descriptions remain readable and do not escape their surface. ".repeat(80)}\nEnd of description.`,
-  );
-  identifiers.longTask = longTask.task.id;
-
-  const running = await createTask(
-    api,
-    "e2e-running",
-    "Implement the modern control-plane UI",
-    workerOnline,
-    identifiers.factoryRepository,
-    "Build the complete browser interface, verify it against the real server, and preserve unrelated state.",
-  );
-  const active = await claimAndStart(api, "claim-running");
-  await api.post(`/api/v1/attempts/${active.attempt.id}/events`, {
-    data: {
-      lease_token: active.token,
-      events: [
-        {
-          sequence: 0,
-          kind: "codex",
-          payload: {
-            type: "item.completed",
-            item: { type: "agent_message", text: "Inspected the control-plane contract." },
-          },
-        },
-        {
-          sequence: 1,
-          kind: "codex",
-          payload: {
-            type: "item.completed",
-            item: {
-              type: "command_execution",
-              command: "npm test",
-              aggregated_output: "RAW_COMMAND_OUTPUT_SHOULD_NOT_RENDER",
-              exit_code: 0,
-            },
-          },
-        },
-        { sequence: 2, kind: "codex", payload: { type: "thread.started", thread_id: "thread-e2e" } },
-        { sequence: 3, kind: "check", payload: { summary: "Running browser verification." } },
-      ],
-    },
-  });
-  identifiers.runningTask = running.task.id;
-  identifiers.runningAttempt = active.attempt.id;
-
-  await registerWorker(
-    api,
-    workerOnline,
-    "Build Mac",
-    onlineRepositories,
-    1,
-    [succeededAttempt.attempt.id, failedAttempt.attempt.id],
-  );
-  await api.dispose();
+test.beforeAll(async ({ request }) => {
+  await expect.poll(async () => {
+    const response = await request.get("/api/v1/repositories");
+    if (!response.ok()) return 0;
+    const body = await response.json() as { repositories?: unknown[] };
+    return body.repositories?.length ?? 0;
+  }, { timeout: 30_000 }).toBeGreaterThan(0);
 });
 
-test("shows retained Factory metrics and saves the overview", async ({ page }) => {
-  const browser = observeBrowser(page);
-  const api = await request.newContext({ baseURL: "http://127.0.0.1:17437" });
-  const summary = await json<{
-    executions_created: number;
-    executions_completed: number;
-    queued: number;
-    running: number;
-  }>(await api.get("/api/v1/metrics/summary?window=7d"));
-  await api.dispose();
+test("creates a Routine and completes its Work", async ({ page }) => {
+  await page.goto("/routines");
+  await expect(page.getByRole("heading", { name: "Routines", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Definitions" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Automations" })).toHaveCount(0);
 
-  await page.goto("/");
-  await expect(page.getByRole("heading", { name: "Factory overview" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Overview", exact: true })).toHaveAttribute(
-    "aria-current",
-    "page",
-  );
-  await expect(
-    page.locator(".metric-card").filter({ hasText: "Executions created" }).locator("strong"),
-  ).toHaveText(String(summary.executions_created));
-  await expect(
-    page.locator(".metric-card").filter({ hasText: "Executions completed" }).locator("strong"),
-  ).toHaveText(String(summary.executions_completed));
-  await expect(page.locator(".health-metrics").getByText(String(summary.queued), { exact: true })).toBeVisible();
-  await expect(page.locator(".health-metrics").getByText(String(summary.running), { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "30 days" }).click();
-  await expect(page.getByRole("button", { name: "30 days" })).toHaveAttribute("aria-pressed", "true");
-  await page.screenshot({ path: "test-results/screenshots/overview-desktop.png", fullPage: true });
-  browser.assertClean();
-});
+  await page.getByRole("button", { name: "New Routine", exact: true }).first().click();
+  const dialog = page.getByRole("dialog", { name: "New Routine" });
+  await expect(dialog.getByText("Tools", { exact: true })).toHaveCount(0);
+  await dialog.getByLabel("Name").fill(routineName);
+  await dialog.getByLabel("Prompt").fill("Review this repository and leave deterministic browser evidence.");
+  await dialog.locator(".repository-picker button").first().click();
+  await dialog.getByRole("button", { name: "Save Routine" }).click();
 
-test("runs the complete UI to real-worker and Git-worktree workflow", async ({ page }) => {
-  const browser = observeBrowser(page);
-  await page.goto("/");
-  await page.getByRole("button", { name: "Delegate task" }).first().click();
-  const dialog = page.getByRole("dialog", { name: "Delegate task" });
-  await dialog.getByLabel("Worker").selectOption(realWorker);
-  await expect(
-    dialog.getByLabel("Repository").getByRole("option", { name: /factory-demo/ }),
-  ).toHaveCount(1);
-  await expect(
-    dialog.getByLabel("Repository").getByRole("option", { name: /handbook-demo/ }),
-  ).toHaveCount(1);
-  await dialog.getByLabel("Title").fill("Prove the complete local workflow");
-  await dialog
-    .getByLabel("Description")
-    .fill("Create deterministic evidence in the assigned real Git worktree.");
-  await dialog.getByLabel("Repository").selectOption(identifiers.realFactoryRepository);
-  await page.screenshot({
-    path: "test-results/screenshots/delegate-desktop.png",
-    fullPage: true,
-  });
-  await dialog.getByRole("button", { name: "Delegate task" }).click();
+  const routine = page.locator("article").filter({ hasText: routineName });
+  await expect(routine).toContainText("1 repos");
+  await routine.getByRole("button", { name: "Run now" }).click();
 
-  await expect(page.getByRole("heading", { name: "Prove the complete local workflow" })).toBeVisible();
-  await expect(page.getByText("Succeeded", { exact: true }).first()).toBeVisible({
-    timeout: 30_000,
-  });
-  await expect(page.getByText("Created deterministic worktree evidence.")).toBeVisible();
+  await expect(page).toHaveURL(/\/work\/[0-9a-f-]+$/);
+  await expect(page.getByRole("heading", { name: routineName })).toBeVisible();
+  await expect(page.getByText("Succeeded", { exact: true })).toBeVisible({ timeout: 45_000 });
+  await page.locator(".target-row summary").click();
   await expect(page.getByText("Completed by deterministic fake Codex.", { exact: false })).toBeVisible();
-  await expect(page.getByText(/Branch: factory\//)).toBeVisible();
-  await expect(page.getByText(/Worktree: .*factory-ui-e2e-.*\/worker\/worktrees\//)).toBeVisible();
-  await page.screenshot({
-    path: "test-results/screenshots/task-detail-desktop.png",
-    fullPage: true,
-  });
-
-  const taskID = new URL(page.url()).pathname.split("/").at(-1)!;
-  await page.reload();
-  await expect(page.getByRole("heading", { name: "Prove the complete local workflow" })).toBeVisible();
-
-  const api = await request.newContext({ baseURL: "http://127.0.0.1:17437" });
-  const detail = await json<TaskDetail>(await api.get(`/api/v1/tasks/${taskID}`));
-  expect(detail.task.state).toBe("succeeded");
-  expect(detail.attempts).toHaveLength(1);
-  expect(detail.attempts[0].result).toContain("Branch: factory/");
-  const worker = await json<{
-    retained_worktrees: Array<{ attempt_id: string; path: string; cleanup_command: string }>;
-  }>(await api.get(`/api/v1/workers/${realWorker}`));
-  const retained = worker.retained_worktrees.find(
-    (worktree) => worktree.attempt_id === detail.attempts[0].id,
-  );
-  expect(retained?.path).toContain("/worker/worktrees/");
-  expect(retained?.cleanup_command).toContain(`factory-worker cleanup ${detail.attempts[0].id}`);
-  await api.dispose();
-  browser.assertClean();
+  await expect(page.getByText("Attempt 1", { exact: true })).toBeVisible();
+  await expect(page.locator(".attempt-events")).toContainText("Inspected the assigned repository.");
 });
 
-test("cancels active work running in the real worker", async ({ page }) => {
-  const browser = observeBrowser(page);
-  await page.goto("/");
-  await page.getByRole("button", { name: "Delegate task" }).first().click();
-  const dialog = page.getByRole("dialog", { name: "Delegate task" });
-  await dialog.getByLabel("Worker").selectOption(realWorker);
-  await dialog.getByLabel("Title").fill("Cancel a real active Codex process");
-  await dialog
-    .getByLabel("Description")
-    .fill("FACTORY_E2E_WAIT until the operator cancels this task.");
-  await dialog.getByLabel("Repository").selectOption(identifiers.realHandbookRepository);
-  await dialog.getByRole("button", { name: "Delegate task" }).click();
-
-  await expect(page.getByText("Running", { exact: true }).first()).toBeVisible({
-    timeout: 30_000,
-  });
-  await expect(page.getByText("Waiting for operator cancellation.")).toBeVisible();
-  await page.getByRole("button", { name: "Cancel" }).click();
-  await page.getByRole("button", { name: "Confirm cancel" }).click();
-  await expect(page.getByText("Cancelled", { exact: true }).first()).toBeVisible({
-    timeout: 20_000,
-  });
-  await expect(page.getByText("attempt cancelled", { exact: false })).toBeVisible();
-  browser.assertClean();
-});
-
-test("renders every state and saves the desktop Work view", async ({ page }) => {
-  const browser = observeBrowser(page);
+test("shows the same Work as a table, list, and board", async ({ page }) => {
   await page.goto("/work");
-  await expect(page.getByRole("heading", { name: "Agent work" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Work", exact: true })).toHaveAttribute(
-    "aria-current",
-    "page",
-  );
-  for (const state of ["Queued", "Running", "Succeeded", "Failed", "Cancelled"]) {
-    await expect(page.getByRole("region", { name: new RegExp(`^${state}`) })).toBeVisible();
-  }
-  await expect(page.getByText("Long operational title", { exact: false })).toBeVisible();
-  await page.screenshot({ path: "test-results/screenshots/work-desktop.png", fullPage: true });
-  browser.assertClean();
+  await expect(page.getByRole("heading", { name: "Work", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: new RegExp(routineName) })).toBeVisible();
+
+  await page.getByRole("button", { name: "List", exact: true }).click();
+  await expect(page).toHaveURL(/view=list/);
+  await expect(page.getByText(routineName, { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Board", exact: true }).click();
+  await expect(page).toHaveURL(/view=kanban/);
+  await expect(page.getByText("Done", { exact: true })).toBeVisible();
+  await expect(page.getByText(routineName, { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Table", exact: true }).click();
+  await expect(page).toHaveURL(/\/work$/);
 });
 
-test("confirms and deletes terminal task history", async ({ page }) => {
-  const browser = observeBrowser(page);
-  await page.goto(`/tasks/${identifiers.succeededTask}`);
-  await expect(page.getByRole("heading", { name: "Ship the stable API client" })).toBeVisible();
-  await page.waitForLoadState("networkidle");
-  await page.getByRole("button", { name: "Delete history" }).click();
-  await expect(page.getByText(/Permanently delete this task, prompt, attempts, and events/)).toBeVisible();
-  await page.getByRole("button", { name: "Confirm delete" }).click();
-  await expect(page).toHaveURL("/work");
-  await expect(page.getByText("Ship the stable API client")).toHaveCount(0);
-  browser.assertClean();
-
-  const api = await request.newContext({ baseURL: "http://127.0.0.1:17437" });
-  const response = await api.get(`/api/v1/tasks/${identifiers.succeededTask}`);
-  expect(response.status()).toBe(404);
-  await api.dispose();
-});
-
-test("shows worker capacity, current work, retained cleanup, and saves Workers", async ({ page }) => {
-  const browser = observeBrowser(page);
-  await page.goto("/workers");
-  await expect(page.getByRole("heading", { name: "Execution capacity" })).toBeVisible();
-  const workersNavigation = page.getByRole("button", { name: "Workers", exact: true });
-  await expect(workersNavigation).toHaveAttribute("aria-current", "page");
-  await expect(page.getByText("Implement the modern control-plane UI")).toBeVisible();
-  const offlineRow = page.getByRole("button", { name: /Archive Mac/ });
-  await expect(offlineRow).toBeVisible();
-  await expect(offlineRow).toContainText("Offline");
-  await expect(offlineRow).toContainText("Claude Code");
-  await page.screenshot({ path: "test-results/screenshots/workers-desktop.png", fullPage: true });
-
-  await page.getByRole("button", { name: /Build Mac/ }).click();
-  await expect(page.getByRole("heading", { name: "Build Mac" })).toBeVisible();
-  await expect(workersNavigation).toHaveClass(/active/);
-  await expect(workersNavigation).not.toHaveAttribute("aria-current");
-  await expect(page.getByText("factory-worker cleanup attempt-retained-001 --confirm")).toBeVisible();
-  const assign = page.getByRole("button", { name: "Assign work" });
-  await assign.click();
-  await expect(page.getByRole("dialog").getByLabel("Worker")).toHaveValue(workerOnline);
-  await page.keyboard.press("Escape");
-  await expect(assign).toBeFocused();
-  browser.assertClean();
-});
-
-test("delegates with worker-specific repositories and preserves the task on refresh", async ({ page }) => {
-  const browser = observeBrowser(page);
+test("keeps Overview operational and the product navigation small", async ({ page }) => {
   await page.goto("/");
-  await page.getByRole("button", { name: "Delegate task" }).first().click();
-  const dialog = page.getByRole("dialog", { name: "Delegate task" });
-  await dialog.getByLabel("Worker").selectOption(workerOffline);
-  await expect(dialog.getByText(/task will queue until it returns/i)).toBeVisible();
-  await expect(dialog.getByText("This becomes the Claude Code prompt.")).toBeVisible();
-  await expect(dialog.getByLabel("Repository").getByRole("option", { name: /archive/ })).toHaveCount(1);
-  await expect(dialog.getByLabel("Repository").getByRole("option", { name: /factory/ })).toHaveCount(0);
-  await dialog.getByLabel("Title").fill("Durable delegated browser task");
-  await dialog.getByLabel("Description").fill("Created in the real UI and stored by the real Go server.");
-  await dialog.getByLabel("Repository").selectOption(identifiers.offlineRepository);
-  await dialog.getByRole("button", { name: "Delegate task" }).click();
-  await expect(page.getByRole("heading", { name: "Durable delegated browser task" })).toBeVisible();
-  await expect(page.getByText("Claude Code", { exact: true })).toBeVisible();
-  await page.reload();
-  await expect(page.getByRole("heading", { name: "Durable delegated browser task" })).toBeVisible();
-  browser.assertClean();
-});
+  await expect(page.getByRole("heading", { name: "Overview", exact: true })).toBeVisible();
+  await expect(page.getByText("Active work", { exact: true })).toBeVisible();
+  await expect(page.getByText("Completed · 24h", { exact: true })).toBeVisible();
+  const performance = page.getByRole("region", { name: "Run performance" });
+  await expect(performance.getByText("Runs", { exact: true })).toBeVisible();
+  await expect(performance.getByText("Completion rate", { exact: true })).toBeVisible();
+  await expect(performance.getByText("Average cycle time", { exact: true })).toBeVisible();
+  await expect(performance).toContainText("1 completed");
+  const navigation = page.getByRole("navigation", { name: "Primary navigation" });
+  await expect(navigation.getByRole("button")).toHaveCount(5);
+  await expect(navigation.getByRole("group", { name: "Infrastructure" }).getByRole("button")).toHaveText([
+    "Workers",
+    "Repositories",
+  ]);
+  await expect(page.getByText(routineName, { exact: true })).toBeVisible();
 
-test("confirms queued cancellation and explicitly retries a failure", async ({ page }) => {
-  const browser = observeBrowser(page);
-  await page.goto(`/tasks/${identifiers.queuedTask}`);
-  await page.getByRole("button", { name: "Cancel" }).click();
-  await expect(page.getByText("Cancel this task?")).toBeVisible();
-  await page.getByRole("button", { name: "Confirm cancel" }).click();
-  await expect(page.getByText("Cancelled", { exact: true }).first()).toBeVisible();
-
-  await page.goto(`/tasks/${identifiers.failedTask}`);
-  await page.getByRole("button", { name: "Retry task" }).click();
-  await expect(page.getByText("Queued", { exact: true }).first()).toBeVisible();
-  browser.assertClean();
-});
-
-test("shows ordered progress and long task detail", async ({ page }) => {
-  const browser = observeBrowser(page);
-  const eventAfters: string[] = [];
-  page.on("request", (request) => {
-    const url = new URL(request.url());
-    if (url.pathname === `/api/v1/attempts/${identifiers.runningAttempt}/events`) {
-      eventAfters.push(url.searchParams.get("after") ?? "");
-    }
-  });
-  await page.goto(`/tasks/${identifiers.runningTask}`);
-  const workNavigation = page.getByRole("button", { name: "Work", exact: true });
-  await expect(workNavigation).toHaveClass(/active/);
-  await expect(workNavigation).not.toHaveAttribute("aria-current");
-  const events = page.locator(".event-list li");
-  await expect(events).toHaveCount(3);
-  await expect(events.nth(0)).toContainText("Inspected the control-plane contract.");
-  await expect(events.nth(1)).toContainText("Succeeded: npm test");
-  await expect(events.nth(2)).toContainText("Running browser verification.");
-  await expect(page.getByText("RAW_COMMAND_OUTPUT_SHOULD_NOT_RENDER")).toHaveCount(0);
-  await expect(page.getByText("3 updates")).toBeVisible();
-  await expect.poll(() => eventAfters).toContain("-1");
-  await expect.poll(() => eventAfters, { timeout: 8_000 }).toContain("3");
-
-  await page.goto(`/tasks/${identifiers.longTask}`);
-  await expect(page.getByText("End of description.")).toBeVisible();
-  browser.assertClean();
-});
-
-test("supports narrow grouped layouts and saves narrow screenshots", async ({ page }) => {
-  const browser = observeBrowser(page);
-  await page.setViewportSize({ width: 800, height: 900 });
-  await page.goto("/workers");
-  const workerList = page.locator(".workers-list");
-  const tabletListBounds = await workerList.boundingBox();
-  const tabletRowBounds = await page.locator(".worker-row").first().boundingBox();
-  expect(tabletRowBounds?.width ?? Infinity).toBeLessThanOrEqual(
-    tabletListBounds?.width ?? 0,
-  );
-
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto("/");
-  await expect(page.getByRole("heading", { name: "Factory overview" })).toBeVisible();
-  await page.screenshot({ path: "test-results/screenshots/overview-narrow.png", fullPage: true });
-
-  await page.goto("/work");
-  const columns = page.locator(".work-column");
-  await expect(columns).toHaveCount(5);
-  const first = await columns.nth(0).boundingBox();
-  const second = await columns.nth(1).boundingBox();
-  expect(Math.abs((first?.x ?? 0) - (second?.x ?? 1))).toBeLessThan(2);
-  await page.screenshot({ path: "test-results/screenshots/work-narrow.png", fullPage: true });
-
-  await page.goto("/workers");
-  await expect(page.getByRole("heading", { name: "Execution capacity" })).toBeVisible();
-  await page.screenshot({ path: "test-results/screenshots/workers-narrow.png", fullPage: true });
-
-  await page.getByRole("button", { name: "Delegate task" }).click();
-  const dialog = page.getByRole("dialog", { name: "Delegate task" });
-  await dialog.getByLabel("Worker").selectOption(realWorker);
-  await dialog.getByLabel("Title").fill("Narrow viewport delegation");
-  await dialog.getByLabel("Description").fill("Review the complete narrow task form.");
-  await dialog.getByLabel("Repository").selectOption(identifiers.realFactoryRepository);
-  await page.screenshot({ path: "test-results/screenshots/delegate-narrow.png", fullPage: true });
-  await page.keyboard.press("Escape");
-
-  await page.goto(`/tasks/${identifiers.runningTask}`);
-  await expect(page.getByRole("heading", { name: "Implement the modern control-plane UI" })).toBeVisible();
-  await page.screenshot({
-    path: "test-results/screenshots/task-detail-narrow.png",
-    fullPage: true,
-  });
-  browser.assertClean();
-});
-
-test("opens and closes delegation from the keyboard", async ({ page }) => {
-  const browser = observeBrowser(page);
-  await page.goto("/");
-  const delegate = page.getByRole("button", { name: "Delegate task" }).first();
-  await delegate.focus();
-  await page.keyboard.press("Enter");
-  await expect(page.getByLabel("Title")).toBeFocused();
-  await page.keyboard.press("Escape");
-  await expect(page.getByRole("dialog")).toHaveCount(0);
-  await expect(delegate).toBeFocused();
-  browser.assertClean();
+  await page.setViewportSize({ width: 390, height: 560 });
+  await expect(navigation.getByRole("button", { name: "Overview", exact: true })).toBeHidden();
+  await page.keyboard.press("Tab");
+  const mobileMenu = page.getByRole("button", { name: "Toggle navigation" });
+  await expect(mobileMenu).toBeFocused();
+  await mobileMenu.click();
+  await expect(mobileMenu).toHaveAttribute("aria-expanded", "true");
+  await expect(navigation.getByRole("button", { name: "Overview", exact: true })).toBeVisible();
 });

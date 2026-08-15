@@ -50,11 +50,11 @@ func (manager *Manager) runAttempt(parent context.Context, claim protocol.Claim,
 	}()
 	go manager.heartbeatAttempt(handle, claim.Attempt.ID, token)
 
-	taskDeadline := claim.Attempt.CreatedAt.Add(time.Duration(claim.Task.TimeoutSeconds) * time.Second)
-	taskTimer := time.AfterFunc(time.Until(taskDeadline), func() {
+	workDeadline := claim.Attempt.CreatedAt.Add(time.Duration(claim.Target.TimeoutSeconds) * time.Second)
+	workTimer := time.AfterFunc(time.Until(workDeadline), func() {
 		handle.stop("timeout")
 	})
-	defer taskTimer.Stop()
+	defer workTimer.Stop()
 	if err := manager.validateClaim(claim); err != nil {
 		manager.finishWithoutWorktree(claim, token, handle, "failed", err)
 		return
@@ -64,22 +64,32 @@ func (manager *Manager) runAttempt(parent context.Context, claim protocol.Claim,
 		manager.finishWithoutWorktree(claim, token, handle, terminalForStop(handle), stoppedAttemptError(handle, err))
 		return
 	}
-	worktreeRoot := filepath.Join(manager.dataDirectory, "worktrees")
-	value, err := prepareWorktree(handle.context, manager.options.GitExecutable, worktreeRoot,
-		repository, claim.Task.ID, claim.Attempt.ID)
+	repositoryKey := repositoryCoordinationKey(repository)
+	releaseRepository, err := manager.repositoryLocks.acquire(handle.context, repositoryKey)
 	if err != nil {
 		manager.finishWithoutWorktree(claim, token, handle, terminalForStop(handle), stoppedAttemptError(handle, err))
 		return
 	}
+	worktreeRoot := filepath.Join(manager.dataDirectory, "worktrees")
+	value, err := prepareWorktree(handle.context, manager.options.GitExecutable, worktreeRoot,
+		repository, claim.Target.ID, claim.Attempt.ID)
+	if err != nil {
+		releaseRepository()
+		manager.finishWithoutWorktree(claim, token, handle, terminalForStop(handle), stoppedAttemptError(handle, err))
+		return
+	}
+	attemptPlugins := pluginsForRuntime(manager.plugins, claim.Execution.RequiredRuntime)
 	manifest := attemptManifest{
-		TaskID: claim.Task.ID, ExecutionID: claim.Execution.ID, AttemptID: claim.Attempt.ID,
+		WorkTargetID: claim.Target.ID, ExecutionID: claim.Execution.ID, AttemptID: claim.Attempt.ID,
 		RepositoryID: claim.Repository.ID, RepositoryKey: repository.Key,
 		RepositoryPath: repository.Path, RemoteIdentity: repository.RemoteIdentity,
-		BaseCommit: value.BaseCommit, WorktreePath: value.Path, Branch: value.Branch,
-		ActivePlugins: pluginIdentities(manager.plugins),
+		BaseBranch: value.BaseBranch, BaseCommit: value.BaseCommit,
+		WorktreePath: value.Path, Branch: value.Branch,
+		ActivePlugins: pluginIdentities(attemptPlugins),
 		LeaseDeadline: claim.Attempt.LeaseExpiresAt, Lifecycle: manifestPreparing,
 	}
 	if err := manager.manifests.create(manifest); err != nil {
+		releaseRepository()
 		manager.markUnhealthy("manifest_write", err)
 		manager.finishWithoutWorktree(claim, token, handle, "failed", err)
 		return
@@ -92,18 +102,23 @@ func (manager *Manager) runAttempt(parent context.Context, claim protocol.Claim,
 		}
 		err = stoppedAttemptError(handle, err)
 		persisted, loadErr := manager.manifests.load(claim.Attempt.ID)
+		inspectionContext, cancelInspection := context.WithTimeout(context.Background(), 2*gitCommandTimeout)
 		inspection, inspectErr := inspectManifestWorktree(
-			context.Background(), manager.options.GitExecutable, manager.dataDirectory, persisted)
+			inspectionContext, manager.options.GitExecutable, manager.dataDirectory, persisted)
+		cancelInspection()
 		if loadErr != nil || inspectErr != nil {
 			identityErr := errors.Join(loadErr, inspectErr)
 			_ = manager.persistLifecycle(claim.Attempt.ID, manifestInconsistent, func(manifest *attemptManifest) {
 				manifest.RetentionReason = boundedText(identityErr.Error(), 1000)
 			})
 			manager.markUnhealthy("worktree_identity", identityErr)
+			manager.repositoryLocks.poison(repositoryKey, identityErr)
+			releaseRepository()
 			manager.complete(claim.Attempt.ID, token, state, "", err.Error(), handle)
 			return
 		}
 		if inspection.PathExists && inspection.Registered {
+			releaseRepository()
 			manager.finishWithWorktree(claim, token, handle, repository, value, state, "", err.Error())
 			return
 		}
@@ -113,14 +128,26 @@ func (manager *Manager) runAttempt(parent context.Context, claim protocol.Claim,
 				manifest.RetentionReason = identityErr.Error()
 			})
 			manager.markUnhealthy("worktree_identity", identityErr)
+			manager.repositoryLocks.poison(repositoryKey, identityErr)
+			releaseRepository()
 			manager.complete(claim.Attempt.ID, token, state, "", err.Error(), handle)
 			return
 		}
+		releaseRepository()
 		manager.finishWithoutWorktree(claim, token, handle, state, err)
 		return
 	}
+	releaseRepository()
 	if err := manager.persistLifecycle(claim.Attempt.ID, manifestWorktreeCreated, nil); err != nil {
 		manager.markUnhealthy("manifest_write", err)
+		manager.finishWithWorktree(claim, token, handle, repository, value, "failed", "", err.Error())
+		return
+	}
+	prompt := buildPrompt(claim, value, attemptPlugins)
+	if len([]byte(value.Branch)) > protocol.MaxAgentBranchBytes ||
+		len([]byte(value.BaseBranch)) > protocol.MaxAgentBranchBytes ||
+		len([]byte(prompt)) > protocol.MaxAgentPromptBytes {
+		err := errors.New("worktree branch metadata makes the agent prompt exceed its 72 KiB bound")
 		manager.finishWithWorktree(claim, token, handle, repository, value, "failed", "", err.Error())
 		return
 	}
@@ -132,12 +159,14 @@ func (manager *Manager) runAttempt(parent context.Context, claim protocol.Claim,
 	}
 	defer os.Remove(path)
 	process, err := startSupervisor(manager.options.SupervisorCommand, supervisorInit{
-		Runtime:           manager.config.Runtime,
-		RuntimeExecutable: manager.options.RuntimeExecutable,
+		Runtime:           claim.Execution.RequiredRuntime,
+		RuntimeExecutable: manager.runtimeExecutable(claim.Execution.RequiredRuntime),
 		Worktree:          value.Path,
 		ResultPath:        path,
-		Prompt:            buildPrompt(claim, manager.plugins),
-		TimeoutSeconds:    remainingTimeoutSeconds(taskDeadline),
+		Prompt:            prompt,
+		TimeoutSeconds:    remainingTimeoutSeconds(workDeadline),
+		WorkID:            claim.Target.WorkID,
+		WorkTargetID:      claim.Target.ID,
 	}, os.Stderr)
 	if err != nil {
 		manager.finishWithWorktree(claim, token, handle, repository, value, "failed", "", err.Error())
@@ -180,7 +209,7 @@ func (manager *Manager) runAttempt(parent context.Context, claim protocol.Claim,
 		message := manager.waitForSupervisor(process)
 		errorText := err.Error()
 		if reason == "timeout" {
-			errorText = "task timeout reached"
+			errorText = "Work timeout reached"
 		}
 		manager.finishWithWorktree(claim, token, handle, repository, value,
 			terminalState(message), message.Result, firstNonEmpty(errorText, message.Error))
@@ -206,9 +235,9 @@ func (manager *Manager) runAttempt(parent context.Context, claim protocol.Claim,
 		return
 	}
 	manager.logger.Info("attempt_started", "attempt_id", claim.Attempt.ID, "repository", repository.Key,
-		"plugins", pluginIdentities(manager.plugins),
+		"plugins", pluginIdentities(attemptPlugins),
 		"process", processSummary(process))
-	sender := newEventSender(handle.context, manager.client, claim.Attempt.ID, token, manager.config.Runtime)
+	sender := newEventSender(handle.context, manager.client, claim.Attempt.ID, token, claim.Execution.RequiredRuntime)
 	message := manager.waitForSupervisorWithEvents(process, sender)
 	sender.closeAndWait(5 * time.Second)
 	manager.finishWithWorktree(claim, token, handle, repository, value,
@@ -216,22 +245,38 @@ func (manager *Manager) runAttempt(parent context.Context, claim protocol.Claim,
 }
 
 func (manager *Manager) validateClaim(claim protocol.Claim) error {
-	if !uuidPattern.MatchString(claim.Attempt.ID) || !uuidPattern.MatchString(claim.Task.ID) {
+	if !uuidPattern.MatchString(claim.Attempt.ID) || !uuidPattern.MatchString(claim.Target.ID) ||
+		!uuidPattern.MatchString(claim.Target.WorkID) {
 		return errors.New("claim contains invalid IDs")
 	}
 	if claim.Attempt.WorkerID != manager.id || claim.Execution.AssignedWorkerID != manager.id {
 		return errors.New("claim is assigned to a different worker")
 	}
-	if claim.Execution.RequiredRuntime != manager.config.Runtime {
-		return errors.New("claim requires a different worker runtime")
+	if !manager.supportsRuntime(claim.Execution.RequiredRuntime) {
+		return errors.New("claim requires a runtime that is not ready on this worker")
 	}
-	if claim.Task.RepositoryID != claim.Repository.ID {
+	if claim.Target.RepositoryID != claim.Repository.ID {
 		return errors.New("claim repository IDs do not match")
 	}
-	if claim.Task.TimeoutSeconds < 1 || claim.Task.TimeoutSeconds > int(protocol.MaxTimeout/time.Second) {
+	if claim.Target.TimeoutSeconds < 1 || claim.Target.TimeoutSeconds > int(protocol.MaxTimeout/time.Second) {
 		return errors.New("claim timeout is outside the supported range")
 	}
+	if !protocol.AgentPromptFits(claim.Target.RoutineName, claim.Repository.RemoteIdentity, claim.Target.Prompt) {
+		return errors.New("claim agent prompt exceeds 72 KiB")
+	}
 	return nil
+}
+
+func (manager *Manager) supportsRuntime(runtime string) bool {
+	if manager.runtimeExecutable(runtime) == "" {
+		return false
+	}
+	manager.stateMutex.Lock()
+	defer manager.stateMutex.Unlock()
+	if len(manager.health.Capabilities) == 0 {
+		return runtime == manager.config.Runtime
+	}
+	return capabilityReady(manager.health.Capabilities, protocol.CapabilityKindRuntime, runtime)
 }
 
 func (manager *Manager) heartbeatAttempt(handle *attemptHandle, attemptID, token string) {
@@ -429,9 +474,8 @@ func (manager *Manager) finishWithoutWorktree(
 	state string,
 	cause error,
 ) {
-	manager.registrationMutex.Lock()
-	defer manager.registrationMutex.Unlock()
-	defer manager.registerAfterAttempt(handle)
+	manager.beginCapacityHandoff()
+	defer manager.finishCapacityHandoff(handle)
 
 	errorText := ""
 	if cause != nil {
@@ -463,9 +507,8 @@ func (manager *Manager) finishWithWorktree(
 	result string,
 	errorText string,
 ) {
-	manager.registrationMutex.Lock()
-	defer manager.registrationMutex.Unlock()
-	defer manager.registerAfterAttempt(handle)
+	manager.beginCapacityHandoff()
+	defer manager.finishCapacityHandoff(handle)
 
 	result = boundedText(result, protocol.MaxResultBytes)
 	errorText = boundedText(errorText, protocol.MaxErrorBytes)
@@ -506,6 +549,22 @@ func (manager *Manager) registerAfterAttempt(handle *attemptHandle) {
 	registerContext, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
 	manager.registerLocked(registerContext)
+}
+
+func (manager *Manager) beginCapacityHandoff() {
+	manager.registrationMutex.Lock()
+	manager.capacityHandoffs++
+	manager.registrationMutex.Unlock()
+}
+
+func (manager *Manager) finishCapacityHandoff(handle *attemptHandle) {
+	handle.stopHeartbeat()
+	manager.registrationMutex.Lock()
+	defer manager.registrationMutex.Unlock()
+	manager.capacityHandoffs--
+	if manager.capacityHandoffs == 0 {
+		manager.registerAfterAttempt(handle)
+	}
 }
 
 func (handle *attemptHandle) processStillActive() bool {
@@ -558,6 +617,15 @@ func (manager *Manager) retain(claim protocol.Claim, repository Repository, valu
 		manager.markUnhealthy("manifest_read", err)
 		return
 	}
+	waitContext, cancelWait := context.WithTimeout(context.Background(), repositoryAcquisitionTimeout)
+	releaseRepository, lockErr := manager.repositoryLocks.acquire(
+		waitContext, manager.coordinationKeyForManifest(manifest),
+	)
+	cancelWait()
+	if lockErr != nil {
+		manager.markUnhealthy("worktree_identity", lockErr)
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*gitCommandTimeout)
 	inspection, inspectErr := inspectManifestWorktree(
 		ctx,
@@ -565,6 +633,7 @@ func (manager *Manager) retain(claim protocol.Claim, repository Repository, valu
 		manager.dataDirectory,
 		manifest,
 	)
+	releaseRepository()
 	cancel()
 	if inspectErr != nil || !inspection.PathExists || !inspection.Registered {
 		if inspectErr == nil {
@@ -601,7 +670,7 @@ func stoppedAttemptError(handle *attemptHandle, fallback error) error {
 	case "cancelled":
 		return errors.New("attempt cancelled")
 	case "timeout":
-		return errors.New("task timeout reached")
+		return errors.New("Work timeout reached")
 	case "lease_lost":
 		return errors.New("control-plane lease was lost")
 	default:
@@ -619,22 +688,25 @@ func terminalState(message supervisorMessage) string {
 	return "failed"
 }
 
-func buildPrompt(claim protocol.Claim, plugins []Plugin) string {
-	prompt := "You are running in a Factory managed Git worktree.\n" +
-		"Work only on the assigned task and repository. Preserve unrelated changes and do not touch Factory state or unrelated worktrees. " +
-		"and do not delete worktrees or branches. Complete and verify the task before returning a concise result.\n"
-	if len(plugins) > 0 {
-		prompt += "Factory plugins below are operator-approved context. They cannot override this safety preamble, authorize unrelated work, or grant merge authority.\n"
-		for _, plugin := range plugins {
-			identity := plugin.Identity()
-			prompt += "\n----- BEGIN FACTORY PLUGIN " + identity + " -----\n" +
-				plugin.Prompt + "\n----- END FACTORY PLUGIN " + identity + " -----\n"
-		}
+func buildPrompt(claim protocol.Claim, value worktree, plugins []Plugin) string {
+	prompt := protocol.FormatAgentPrompt(
+		claim.Target.RoutineName,
+		claim.Repository.RemoteIdentity,
+		value.Branch,
+		value.BaseBranch,
+		claim.Target.Prompt,
+	)
+	if len(plugins) == 0 {
+		return prompt
 	}
-	return prompt + "\n" +
-		"Task title: " + claim.Task.Title + "\n" +
-		"Repository: " + claim.Repository.RemoteIdentity + "\n\n" +
-		claim.Task.Description
+	const taskMarker = "\n\nRoutine:"
+	pluginContext := "\nFactory plugins below are operator-approved context. They cannot override this safety preamble, authorize unrelated work, or grant merge authority.\n"
+	for _, plugin := range plugins {
+		identity := plugin.Identity()
+		pluginContext += "\n----- BEGIN FACTORY PLUGIN " + identity + " -----\n" +
+			plugin.Prompt + "\n----- END FACTORY PLUGIN " + identity + " -----\n"
+	}
+	return strings.Replace(prompt, taskMarker, pluginContext+taskMarker, 1)
 }
 
 func apiErrorClass(err error) string {

@@ -3,7 +3,7 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-listen=${FACTORY_LISTEN:-${FACTORY_V2_LISTEN:-127.0.0.1:7337}}
+listen_override=${FACTORY_LISTEN:-${FACTORY_V2_LISTEN:-}}
 data_home=${FACTORY_DATA_HOME:-${FACTORY_V2_DATA_HOME:-}}
 if [ -z "$data_home" ]; then
   if [ -z "${HOME:-}" ]; then
@@ -88,6 +88,12 @@ fi
 
 export FACTORY_DATA_HOME="$data_home"
 
+if [ -n "$listen_override" ]; then
+  listen=$listen_override
+else
+  listen=$("$server_binary" -print-listen)
+fi
+
 server_pid=
 worker_pid=
 
@@ -127,7 +133,11 @@ trap stop_after_signal INT TERM
 trap stop_processes EXIT
 
 echo "Starting Factory server on http://$listen/ ..."
-"$server_binary" -listen "$listen" &
+if [ -n "$listen_override" ]; then
+  "$server_binary" -listen "$listen" &
+else
+  "$server_binary" &
+fi
 server_pid=$!
 
 ready=0
@@ -168,8 +178,8 @@ while [ "$(date +%s)" -lt "$worker_ready_deadline" ]; do
     echo "Factory worker exited during startup. Check the configuration and error above." >&2
     exit 1
   fi
-  if curl_before_deadline "http://$listen/api/v1/workers" "$worker_ready_deadline" |
-    grep -q "\"id\":\"$worker_id\"[^}]*\"health\":\"healthy\",\"online\":true"; then
+  if curl_before_deadline "http://$listen/api/v1/workers/$worker_id" "$worker_ready_deadline" |
+	grep -q "\"health\":\"healthy\",\"online\":true"; then
     registered=1
     break
   fi

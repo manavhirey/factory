@@ -1,11 +1,28 @@
 package main
 
 import (
+	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestBackupModeRejectsMissingSourceWithoutCreatingState(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "missing", "factory.sqlite3")
+	destination := filepath.Join(root, "backup", "factory.sqlite3")
+	handled, err := runRecoveryMode(context.Background(), source, destination, "", io.Discard)
+	if !handled || err == nil {
+		t.Fatalf("missing-source backup = handled %v, error %v", handled, err)
+	}
+	for _, path := range []string{source, source + ".v2-control-plane", destination} {
+		if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
+			t.Fatalf("missing-source CLI backup created %s: %v", path, statErr)
+		}
+	}
+}
 
 func TestDefaultDatabasePathUsesFactoryHome(t *testing.T) {
 	home := t.TempDir()
@@ -56,6 +73,94 @@ func TestDefaultDatabasePathHonorsPreviewAlias(t *testing.T) {
 	}
 	if want := filepath.Join(root, "server", "factory.sqlite3"); database != want {
 		t.Fatalf("database = %q, want %q", database, want)
+	}
+}
+
+func TestServerBootstrapConfigIsOptionalAndResolvesRelativeDatabase(t *testing.T) {
+	dataRoot := t.TempDir()
+	t.Setenv("FACTORY_SERVER_CONFIG", "")
+
+	config, err := loadServerBootstrapConfig(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Listen != "" || config.Database != "" || config.path != filepath.Join(dataRoot, "config.toml") {
+		t.Fatalf("missing optional config = %#v", config)
+	}
+
+	path := filepath.Join(dataRoot, "config.toml")
+	if err := os.WriteFile(path, []byte("listen = \"127.0.0.1:7447\"\ndatabase = \"state/factory.sqlite3\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config, err = loadServerBootstrapConfig(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Listen != "127.0.0.1:7447" || config.Database != filepath.Join(dataRoot, "state", "factory.sqlite3") {
+		t.Fatalf("loaded config = %#v", config)
+	}
+}
+
+func TestServerBootstrapConfigRejectsUnknownFieldsAndSymlinks(t *testing.T) {
+	dataRoot := t.TempDir()
+	path := filepath.Join(dataRoot, "config.toml")
+	t.Setenv("FACTORY_SERVER_CONFIG", path)
+	if err := os.WriteFile(path, []byte("listen = \"127.0.0.1:7337\"\nprovider = \"github\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadServerBootstrapConfig(dataRoot); err == nil || !strings.Contains(err.Error(), "unknown Factory server configuration fields: provider") {
+		t.Fatalf("unknown field error = %v", err)
+	}
+
+	target := filepath.Join(dataRoot, "target.toml")
+	if err := os.WriteFile(target, []byte("listen = \"127.0.0.1:7337\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadServerBootstrapConfig(dataRoot); err == nil || !strings.Contains(err.Error(), "regular non-symlink") {
+		t.Fatalf("symlink error = %v", err)
+	}
+}
+
+func TestServerBootstrapConfigAcceptsRetiredWebhookFieldsDuringUpgrade(t *testing.T) {
+	dataRoot := t.TempDir()
+	path := filepath.Join(dataRoot, "config.toml")
+	t.Setenv("FACTORY_SERVER_CONFIG", path)
+	if err := os.WriteFile(path, []byte(`
+listen = "127.0.0.1:7337"
+webhook_listen = "0.0.0.0:7444"
+webhook_tls_cert = "/etc/factory/webhook.crt"
+webhook_tls_key = "/etc/factory/webhook.key"
+github_webhook_secret_file = "/etc/factory/webhook.secret"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := loadServerBootstrapConfig(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Listen != "127.0.0.1:7337" {
+		t.Fatalf("loaded config = %#v", config)
+	}
+}
+
+func TestRemoteWorkerTLSConfigurationIsAllOrNothing(t *testing.T) {
+	for _, values := range [][3]string{
+		{"0.0.0.0:7443", "", ""},
+		{"", "server.crt", "server.key"},
+		{"0.0.0.0:7443", "server.crt", ""},
+	} {
+		if err := validateWorkerTLSConfig(values[0], values[1], values[2]); err == nil {
+			t.Fatalf("accepted partial remote TLS configuration %#v", values)
+		}
+	}
+	if err := validateWorkerTLSConfig("0.0.0.0:7443", "server.crt", "server.key"); err != nil {
+		t.Fatalf("complete remote TLS configuration rejected: %v", err)
 	}
 }
 

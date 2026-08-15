@@ -6,10 +6,16 @@ import (
 )
 
 const (
+	CapabilityKindTool        = "tool"
+	CapabilityKindRuntime     = "runtime"
+	CapabilityReady           = "ready"
+	CapabilityMissing         = "missing"
+	CapabilityUnauthenticated = "unauthenticated"
+	CapabilityUnhealthy       = "unhealthy"
+	RuntimePi                 = "pi"
 	RuntimeCodex              = "codex"
 	RuntimeClaudeCode         = "claude-code"
 	MaxBodyBytes              = 1 << 20
-	MaxDescriptionBytes       = 64 << 10
 	MaxEventBatchBytes        = 256 << 10
 	MaxEventBytes             = 64 << 10
 	MaxEventsPerBatch         = 100
@@ -24,14 +30,27 @@ const (
 	MaxRetainedPerRepo        = 10
 	MaxManagedRepositories    = 1000
 	MaxRepositoryCacheEntries = 100
-	DefaultTaskPageSize       = 50
-	MaxTaskPageSize           = 200
 	DefaultEventPageSize      = 100
 	MaxEventPageSize          = 500
+	MinWorkerCapacity         = 1
+	MaxWorkerCapacity         = 100
+	WorkClaimProtocolVersion  = 1
 )
 
 func SupportedRuntime(value string) bool {
-	return value == RuntimeCodex || value == RuntimeClaudeCode
+	return value == RuntimePi || value == RuntimeCodex || value == RuntimeClaudeCode
+}
+
+func SupportedRuntimes() []string {
+	return []string{RuntimePi, RuntimeCodex, RuntimeClaudeCode}
+}
+
+type Capability struct {
+	Kind    string `json:"kind"`
+	Name    string `json:"name"`
+	Status  string `json:"status"`
+	Version string `json:"version,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 type RepositoryRegistration struct {
@@ -53,11 +72,19 @@ type SourceAccess struct {
 	Hostname string `json:"hostname"`
 }
 
+type WeeklyLimit struct {
+	UsedPercent int       `json:"used_percent"`
+	ResetsAt    time.Time `json:"resets_at"`
+}
+
 type WorkerRegistration struct {
 	Name                       string                   `json:"name"`
+	Labels                     map[string]string        `json:"labels,omitempty"`
 	WorkerVersion              string                   `json:"worker_version"`
+	WorkClaimProtocolVersion   int                      `json:"work_claim_protocol_version,omitempty"`
 	Runtime                    string                   `json:"runtime"`
 	RuntimeVersion             string                   `json:"runtime_version"`
+	Capabilities               []Capability             `json:"capabilities,omitempty"`
 	Capacity                   int                      `json:"capacity"`
 	ActiveCount                int                      `json:"active_count"`
 	Health                     string                   `json:"health"`
@@ -68,6 +95,7 @@ type WorkerRegistration struct {
 	RetainedWorktrees          []RetainedWorktree       `json:"retained_worktrees"`
 	CapacityHandoffVersion     int                      `json:"capacity_handoff_version,omitempty"`
 	DisposedAttemptIDs         []string                 `json:"disposed_attempt_ids,omitempty"`
+	WeeklyLimit                *WeeklyLimit             `json:"weekly_limit,omitempty"`
 }
 
 type Repository struct {
@@ -85,6 +113,31 @@ type ManagedRepository struct {
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 
+type ManagedRepositoryReadiness struct {
+	RoutingReady bool                               `json:"routing_ready"`
+	Workers      []ManagedRepositoryWorkerReadiness `json:"workers"`
+}
+
+type ManagedRepositoryWorkerReadiness struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Cached     bool   `json:"cached"`
+	Advertised bool   `json:"advertised"`
+	Ready      bool   `json:"ready"`
+	Reason     string `json:"reason"`
+}
+
+type WorkerRepositoryOption struct {
+	ID             string `json:"id"`
+	Key            string `json:"key,omitempty"`
+	RemoteIdentity string `json:"remote_identity"`
+	Enabled        bool   `json:"enabled"`
+	Cached         bool   `json:"cached"`
+	Advertised     bool   `json:"advertised"`
+	Ready          bool   `json:"ready"`
+	Reason         string `json:"reason"`
+}
+
 type CreateManagedRepositoryRequest struct {
 	RemoteIdentity string `json:"remote_identity"`
 }
@@ -96,9 +149,11 @@ type SetManagedRepositoryEnabledRequest struct {
 type Worker struct {
 	ID                         string             `json:"id"`
 	Name                       string             `json:"name"`
+	Labels                     map[string]string  `json:"labels,omitempty"`
 	WorkerVersion              string             `json:"worker_version"`
 	Runtime                    string             `json:"runtime"`
 	RuntimeVersion             string             `json:"runtime_version"`
+	Capabilities               []Capability       `json:"capabilities,omitempty"`
 	Capacity                   int                `json:"capacity"`
 	ActiveCount                int                `json:"active_count"`
 	Health                     string             `json:"health"`
@@ -108,62 +163,29 @@ type Worker struct {
 	AcceptsManagedRepositories bool               `json:"accepts_managed_repositories,omitempty"`
 	RepositoryCacheCount       int                `json:"repository_cache_count,omitempty"`
 	RetainedWorktrees          []RetainedWorktree `json:"retained_worktrees"`
-	CurrentTaskTitle           string             `json:"current_task_title,omitempty"`
+	CurrentWorkTitle           string             `json:"current_work_title,omitempty"`
 	RegisteredAt               time.Time          `json:"registered_at"`
 	LastHeartbeat              time.Time          `json:"last_heartbeat"`
 }
 
-type CreateTaskRequest struct {
-	RequestKey     string     `json:"request_key"`
-	Title          string     `json:"title"`
-	Description    string     `json:"description"`
-	WorkerID       string     `json:"worker_id,omitempty"`
-	RepositoryID   string     `json:"repository_id,omitempty"`
-	Route          *TaskRoute `json:"route,omitempty"`
-	TimeoutSeconds int        `json:"timeout_seconds"`
+type WorkerEnrollment struct {
+	WorkerID        string    `json:"worker_id"`
+	EnrollmentToken string    `json:"enrollment_token"`
+	ExpiresAt       time.Time `json:"expires_at"`
 }
 
-type TaskRoute struct {
-	RepositoryRemoteIdentity string       `json:"repository_remote_identity"`
-	SourceAccess             SourceAccess `json:"source_access"`
+type CreateWorkerEnrollmentRequest struct {
+	WorkerID string `json:"worker_id"`
 }
 
-type Task struct {
-	ID             string    `json:"id"`
-	RequestKey     string    `json:"request_key"`
-	Title          string    `json:"title"`
-	Description    string    `json:"description,omitempty"`
-	WorkerID       string    `json:"worker_id"`
-	RepositoryID   string    `json:"repository_id"`
-	TimeoutSeconds int       `json:"timeout_seconds"`
-	State          string    `json:"state"`
-	CreatedAt      time.Time `json:"created_at"`
+type ExchangeWorkerEnrollmentRequest struct {
+	WorkerID        string `json:"worker_id"`
+	EnrollmentToken string `json:"enrollment_token"`
+	Credential      string `json:"credential"`
 }
 
-type TaskCursor struct {
-	CreatedAtMillis int64
-	ID              string
-}
-
-type TaskPageRequest struct {
-	Limit  int
-	Cursor *TaskCursor
-}
-
-type TaskPage struct {
-	Tasks      []Task
-	NextCursor *TaskCursor
-}
-
-type Execution struct {
-	ID                    string    `json:"id"`
-	TaskID                string    `json:"task_id"`
-	AssignedWorkerID      string    `json:"assigned_worker_id"`
-	RequiredRuntime       string    `json:"required_runtime"`
-	State                 string    `json:"state"`
-	CancellationRequested bool      `json:"cancellation_requested"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
+type WorkerCredential struct {
+	Credential string `json:"credential"`
 }
 
 type Attempt struct {
@@ -183,41 +205,16 @@ type Attempt struct {
 	CreatedAt       time.Time  `json:"created_at"`
 }
 
-type TaskDetail struct {
-	Task                Task       `json:"task"`
-	Execution           Execution  `json:"execution"`
-	Repository          Repository `json:"repository"`
-	RepositoryAvailable bool       `json:"repository_available"`
-	Attempts            []Attempt  `json:"attempts"`
-}
-
-type MetricsSummary struct {
-	Window                 string    `json:"window"`
-	GeneratedAt            time.Time `json:"generated_at"`
-	ExecutionsCreated      int64     `json:"executions_created"`
-	ExecutionsCompleted    int64     `json:"executions_completed"`
-	Succeeded              int64     `json:"succeeded"`
-	Failed                 int64     `json:"failed"`
-	Cancelled              int64     `json:"cancelled"`
-	Queued                 int64     `json:"queued"`
-	Running                int64     `json:"running"`
-	SuccessRate            *float64  `json:"success_rate"`
-	RetryRate              *float64  `json:"retry_rate"`
-	MedianCycleTimeSeconds *float64  `json:"median_cycle_time_seconds"`
-	WorkersOnline          int64     `json:"workers_online"`
-	WorkersTotal           int64     `json:"workers_total"`
-}
-
 type ClaimRequest struct {
 	RequestID  string `json:"request_id"`
 	LeaseToken string `json:"lease_token"`
 }
 
 type Claim struct {
-	Attempt    Attempt    `json:"attempt"`
-	Execution  Execution  `json:"execution"`
-	Task       Task       `json:"task"`
-	Repository Repository `json:"repository"`
+	Attempt    Attempt           `json:"attempt"`
+	Execution  WorkExecution     `json:"execution"`
+	Target     ClaimedWorkTarget `json:"target"`
+	Repository Repository        `json:"repository"`
 }
 
 type LeaseRequest struct {

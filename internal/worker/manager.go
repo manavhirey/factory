@@ -3,6 +3,8 @@ package worker
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -31,6 +33,7 @@ type Options struct {
 	GitExecutable        string
 	GitHubExecutable     string
 	RuntimeExecutable    string
+	RuntimeExecutables   map[string]string
 	SupervisorCommand    []string
 	HTTPClient           *http.Client
 	Random               io.Reader
@@ -59,26 +62,33 @@ type Manager struct {
 	plugins           []Plugin
 	slots             chan struct{}
 
-	stateMutex           sync.Mutex
-	health               health
-	active               map[string]*attemptHandle
-	seen                 map[string]bool
-	retained             map[string]protocol.RetainedWorktree
-	retainedCounts       map[string]int
-	managedRepositoryIDs map[string]bool
-	disposed             map[string]bool
-	pending              map[string]context.CancelFunc
-	fatalHealth          error
-	registered           bool
-	closed               bool
+	stateMutex                    sync.Mutex
+	health                        health
+	active                        map[string]*attemptHandle
+	seen                          map[string]bool
+	retained                      map[string]protocol.RetainedWorktree
+	retainedCounts                map[string]int
+	managedRepositoryIDs          map[string]bool
+	managedRepositoryReservations map[string]bool
+	disposed                      map[string]bool
+	pending                       map[string]context.CancelFunc
+	claiming                      bool
+	healthCheckPending            bool
+	healthCheckDone               chan struct{}
+	fatalHealth                   error
+	registered                    bool
+	registrationGeneration        uint64
+	advertisedGeneration          uint64
+	hasAdvertisedRegistration     bool
+	closed                        bool
 
-	randomMutex sync.Mutex
-	// repositoryCacheMutex bounds clone/fetch activity to one repository at a
-	// time per worker and protects cache creation from concurrent claims.
-	repositoryCacheMutex sync.Mutex
-	// registrationMutex keeps a periodic registration from overtaking the
-	// terminal-attempt to retained-worktree capacity handoff.
+	randomMutex     sync.Mutex
+	repositoryLocks repositoryLockSet
+	// registrationMutex serializes registrations and protects capacityHandoffs.
+	// A positive handoff count pauses periodic registration without serializing
+	// repository-local cleanup for unrelated attempts.
 	registrationMutex sync.Mutex
+	capacityHandoffs  int
 	waitGroup         sync.WaitGroup
 }
 
@@ -89,6 +99,7 @@ func New(config Config, options Options, logger *slog.Logger) (*Manager, error) 
 	if config.Runtime == "" {
 		config.Runtime = protocol.RuntimeCodex
 	}
+	config.Runtimes = configuredRuntimes(config)
 	if err := validateConfig(config); err != nil {
 		return nil, err
 	}
@@ -96,7 +107,7 @@ func New(config Config, options Options, logger *slog.Logger) (*Manager, error) 
 	if err != nil {
 		return nil, err
 	}
-	options = options.withDefaults(config.Runtime)
+	options = options.withDefaults(config.Runtime, config.Runtimes)
 	if len(options.SupervisorCommand) == 0 {
 		return nil, errors.New("resolve factory-worker executable for attempt supervision")
 	}
@@ -129,47 +140,91 @@ func New(config Config, options Options, logger *slog.Logger) (*Manager, error) 
 	if logger == nil {
 		logger = slog.Default()
 	}
+	httpClient, err := workerHTTPClient(config, options.HTTPClient)
+	if err != nil {
+		return nil, err
+	}
+	workerClient := newClient(config.Server, httpClient)
+	credentialPath := filepath.Join(dataDirectory, "worker-credential")
+	if err := adoptLegacyWorkerCredentialFiles(dataDirectory, config.Server); err != nil {
+		return nil, err
+	}
+	workerClient.credential, err = loadCredentialFile(credentialPath, config.Server)
+	if err != nil {
+		return nil, err
+	}
 	byKey := make(map[string]Repository, len(repositories))
 	for _, repository := range repositories {
 		byKey[repository.Key] = repository
 	}
 	cleanupLock = false
 	return &Manager{
-		config:               config,
-		options:              options,
-		logger:               logger,
-		id:                   id,
-		dataDirectory:        dataDirectory,
-		lock:                 lock,
-		repositories:         repositories,
-		repositoriesByKey:    byKey,
-		client:               newClient(config.Server, options.HTTPClient),
-		manifests:            newManifestStore(dataDirectory, id),
-		plugins:              plugins,
-		slots:                make(chan struct{}, config.MaxConcurrent),
-		health:               health{State: "unhealthy"},
-		active:               make(map[string]*attemptHandle),
-		seen:                 make(map[string]bool),
-		retained:             make(map[string]protocol.RetainedWorktree),
-		retainedCounts:       make(map[string]int),
-		managedRepositoryIDs: managedRepositoryIDs,
-		disposed:             make(map[string]bool),
-		pending:              make(map[string]context.CancelFunc),
+		config:                        config,
+		options:                       options,
+		logger:                        logger,
+		id:                            id,
+		dataDirectory:                 dataDirectory,
+		lock:                          lock,
+		repositories:                  repositories,
+		repositoriesByKey:             byKey,
+		client:                        workerClient,
+		manifests:                     newManifestStore(dataDirectory, id),
+		plugins:                       plugins,
+		slots:                         make(chan struct{}, config.MaxConcurrent),
+		health:                        health{State: "unhealthy"},
+		active:                        make(map[string]*attemptHandle),
+		seen:                          make(map[string]bool),
+		retained:                      make(map[string]protocol.RetainedWorktree),
+		retainedCounts:                make(map[string]int),
+		managedRepositoryIDs:          managedRepositoryIDs,
+		managedRepositoryReservations: make(map[string]bool),
+		disposed:                      make(map[string]bool),
+		pending:                       make(map[string]context.CancelFunc),
 	}, nil
 }
 
-func (options Options) withDefaults(runtime string) Options {
+func workerHTTPClient(config Config, provided *http.Client) (*http.Client, error) {
+	if provided != nil || config.CACertificate == "" {
+		return provided, nil
+	}
+	pem, err := os.ReadFile(config.CACertificate)
+	if err != nil {
+		return nil, fmt.Errorf("read ca_certificate: %w", err)
+	}
+	roots, err := x509.SystemCertPool()
+	if err != nil || roots == nil {
+		roots = x509.NewCertPool()
+	}
+	if !roots.AppendCertsFromPEM(pem) {
+		return nil, errors.New("ca_certificate contains no certificates")
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+	return &http.Client{Transport: transport}, nil
+}
+
+func (options Options) withDefaults(primaryRuntime string, runtimes []string) Options {
 	if options.GitExecutable == "" {
 		options.GitExecutable = "git"
 	}
 	if options.GitHubExecutable == "" {
 		options.GitHubExecutable = "gh"
 	}
-	if options.RuntimeExecutable == "" {
-		if runtime == protocol.RuntimeClaudeCode {
-			options.RuntimeExecutable = "claude"
-		} else {
-			options.RuntimeExecutable = "codex"
+	if options.RuntimeExecutables == nil {
+		options.RuntimeExecutables = make(map[string]string, len(runtimes))
+	} else {
+		copy := make(map[string]string, len(options.RuntimeExecutables)+len(runtimes))
+		for runtime, executable := range options.RuntimeExecutables {
+			copy[runtime] = executable
+		}
+		options.RuntimeExecutables = copy
+	}
+	if options.RuntimeExecutable != "" {
+		options.RuntimeExecutables[primaryRuntime] = options.RuntimeExecutable
+	}
+	for _, runtime := range runtimes {
+		if options.RuntimeExecutables[runtime] == "" {
+			options.RuntimeExecutables[runtime] = defaultRuntimeExecutable(runtime)
 		}
 	}
 	if len(options.SupervisorCommand) == 0 {
@@ -211,10 +266,58 @@ func (options Options) withDefaults(runtime string) Options {
 	return options
 }
 
+func defaultRuntimeExecutable(runtime string) string {
+	switch runtime {
+	case protocol.RuntimePi:
+		return "pi"
+	case protocol.RuntimeClaudeCode:
+		return "claude"
+	default:
+		return "codex"
+	}
+}
+
+func (manager *Manager) runtimeExecutable(runtime string) string {
+	if executable := manager.options.RuntimeExecutables[runtime]; executable != "" {
+		return executable
+	}
+	if runtime == manager.config.Runtime {
+		if manager.options.RuntimeExecutable != "" {
+			return manager.options.RuntimeExecutable
+		}
+		return defaultRuntimeExecutable(runtime)
+	}
+	return ""
+}
+
 func (manager *Manager) ID() string { return manager.id }
 
 func (manager *Manager) Run(ctx context.Context) error {
 	defer manager.Close()
+	enrollmentBackoff := manager.options.TransportBackoffMin
+	for {
+		err := manager.client.enroll(ctx, manager.id, manager.config.EnrollmentToken,
+			filepath.Join(manager.dataDirectory, "worker-credential"))
+		if err == nil {
+			break
+		}
+		var retryable retryableEnrollmentError
+		if !errors.As(err, &retryable) {
+			return err
+		}
+		manager.logger.Warn("worker_enrollment_retry", "error_class", "transient", "error", err)
+		timer := time.NewTimer(enrollmentBackoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+		enrollmentBackoff *= 2
+		if enrollmentBackoff > manager.options.TransportBackoffMax {
+			enrollmentBackoff = manager.options.TransportBackoffMax
+		}
+	}
 	for {
 		err := manager.reconcile(ctx)
 		if err == nil {
@@ -242,6 +345,21 @@ func (manager *Manager) Run(ctx context.Context) error {
 	defer registrationTicker.Stop()
 	claimTimer := time.NewTimer(0)
 	defer claimTimer.Stop()
+	healthResults := make(chan health, 1)
+	startHealthCheck := func() {
+		if !manager.beginHealthCheck() {
+			return
+		}
+		manager.waitGroup.Add(1)
+		go func() {
+			defer manager.waitGroup.Done()
+			result := manager.checkHealth(ctx)
+			select {
+			case healthResults <- result:
+			case <-ctx.Done():
+			}
+		}()
+	}
 
 	for {
 		select {
@@ -249,7 +367,11 @@ func (manager *Manager) Run(ctx context.Context) error {
 			manager.stopAll("cancelled")
 			return manager.waitForShutdown()
 		case <-healthTicker.C:
-			manager.setHealth(manager.checkHealth(ctx))
+			startHealthCheck()
+		case result := <-healthResults:
+			if manager.setHealth(result) {
+				manager.register(ctx)
+			}
 		case <-registrationTicker.C:
 			manager.register(ctx)
 		case <-claimTimer.C:
@@ -263,8 +385,8 @@ func (manager *Manager) Run(ctx context.Context) error {
 
 func (manager *Manager) checkHealth(ctx context.Context) health {
 	value := checkHealth(ctx, manager.options.GitExecutable,
-		manager.config.Runtime, manager.options.RuntimeExecutable,
-		manager.options.GitHubExecutable, manager.config.SourceAccess)
+		manager.options.GitHubExecutable, manager.config.Runtime,
+		manager.config.Runtimes, manager.options.RuntimeExecutables)
 	if value.State != "healthy" {
 		return value
 	}

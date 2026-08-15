@@ -22,6 +22,7 @@ var commitPattern = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
 type worktree struct {
 	Path       string
 	Branch     string
+	BaseBranch string
 	BaseCommit string
 	HeadCommit string
 }
@@ -39,6 +40,16 @@ func resolveRepositories(config Config, gitExecutable string) ([]Repository, err
 		repository, err := resolveRepository(key, config.Repositories[key].Path, gitExecutable)
 		if err != nil {
 			return nil, fmt.Errorf("repository %q: %w", key, err)
+		}
+		repository.coordinationKey = legacyRepositoryCoordinationKey(repository)
+		repository.BaseBranch = config.Repositories[key].BaseBranch
+		if repository.BaseBranch != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), gitCommandTimeout)
+			err = validateBaseBranch(ctx, gitExecutable, repository, repository.BaseBranch)
+			cancel()
+			if err != nil {
+				return nil, fmt.Errorf("repository %q: %w", key, err)
+			}
 		}
 		if previous := paths[repository.Path]; previous != "" {
 			return nil, fmt.Errorf("repositories %q and %q resolve to the same path", previous, key)
@@ -228,20 +239,9 @@ func sameRemoteIdentity(left, right string) bool {
 	return remoteIdentityComparisonKey(left) == remoteIdentityComparisonKey(right)
 }
 
-func createWorktree(ctx context.Context, gitExecutable, root string, repository Repository, taskID, attemptID string) (worktree, error) {
-	value, err := prepareWorktree(ctx, gitExecutable, root, repository, taskID, attemptID)
-	if err != nil {
-		return value, err
-	}
-	if err := addPreparedWorktree(ctx, gitExecutable, repository, value); err != nil {
-		return value, err
-	}
-	return value, nil
-}
-
-func prepareWorktree(ctx context.Context, gitExecutable, root string, repository Repository, taskID, attemptID string) (worktree, error) {
-	if !uuidPattern.MatchString(taskID) || !uuidPattern.MatchString(attemptID) {
-		return worktree{}, errors.New("server returned an invalid task or attempt ID")
+func prepareWorktree(ctx context.Context, gitExecutable, root string, repository Repository, workTargetID, attemptID string) (worktree, error) {
+	if !uuidPattern.MatchString(workTargetID) || !uuidPattern.MatchString(attemptID) {
+		return worktree{}, errors.New("server returned an invalid Work target or attempt ID")
 	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return worktree{}, fmt.Errorf("create worktree root: %w", err)
@@ -261,20 +261,152 @@ func prepareWorktree(ctx context.Context, gitExecutable, root string, repository
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return worktree{}, fmt.Errorf("inspect attempt worktree path: %w", err)
 	}
-	base := repository.BaseCommit
+	baseBranch, base := repository.BaseBranch, repository.BaseCommit
 	if base == "" {
-		stdout, stderr, err := runGitCommand(ctx, gitExecutable, repository.Path, 64<<10, "rev-parse", "HEAD")
+		baseBranch, base, err = resolveBaseCommit(ctx, gitExecutable, repository)
 		if err != nil {
-			return worktree{}, commandFailure("resolve repository HEAD", stdout, stderr, err)
+			return worktree{}, err
 		}
-		base = strings.TrimSpace(string(stdout))
+	} else if baseBranch == "" || !commitPattern.MatchString(base) {
+		return worktree{}, errors.New("pre-resolved repository base must include a branch and full commit ID")
+	}
+	branch := "factory/" + workTargetID[:12] + "-" + attemptID[:12]
+	value := worktree{
+		Path: path, Branch: branch, BaseBranch: baseBranch,
+		BaseCommit: base, HeadCommit: base,
+	}
+	return value, nil
+}
+
+func resolveBaseCommit(
+	ctx context.Context,
+	gitExecutable string,
+	repository Repository,
+) (string, string, error) {
+	if err := validateRegisteredOrigin(ctx, gitExecutable, repository); err != nil {
+		return "", "", err
+	}
+	branch := repository.BaseBranch
+	var base string
+	if branch == "" {
+		var err error
+		branch, base, err = discoverRemoteDefaultBranch(ctx, gitExecutable, repository)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	if err := validateBaseBranch(ctx, gitExecutable, repository, branch); err != nil {
+		return "", "", err
+	}
+	if base == "" {
+		var err error
+		base, err = remoteBranchCommit(ctx, gitExecutable, repository, branch)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	stdout, _, localErr := runGitCommand(ctx, gitExecutable, repository.Path, 64<<10,
+		"rev-parse", "--verify", base+"^{commit}")
+	if localErr != nil || strings.TrimSpace(string(stdout)) != base {
+		stdout, stderr, err := runGitCommand(ctx, gitExecutable, repository.Path, 256<<10,
+			"fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "origin", "refs/heads/"+branch)
+		if err != nil {
+			return "", "", commandFailure("fetch base branch origin/"+branch, stdout, stderr, err)
+		}
+		stdout, stderr, err = runGitCommand(ctx, gitExecutable, repository.Path, 64<<10,
+			"rev-parse", "--verify", base+"^{commit}")
+		if err != nil || strings.TrimSpace(string(stdout)) != base {
+			if err == nil {
+				err = errors.New("fetched branch did not contain the advertised commit")
+			}
+			return "", "", commandFailure("resolve fetched base branch origin/"+branch, stdout, stderr, err)
+		}
 	}
 	if !commitPattern.MatchString(base) {
-		return worktree{}, errors.New("repository HEAD is not a full commit ID")
+		return "", "", errors.New("base branch did not resolve to a full commit ID")
 	}
-	branch := "factory/" + taskID[:12] + "-" + attemptID[:12]
-	value := worktree{Path: path, Branch: branch, BaseCommit: base, HeadCommit: base}
-	return value, nil
+	if err := validateRegisteredOrigin(ctx, gitExecutable, repository); err != nil {
+		return "", "", err
+	}
+	return branch, base, nil
+}
+
+func validateRegisteredOrigin(ctx context.Context, gitExecutable string, repository Repository) error {
+	stdout, stderr, err := runGitCommand(ctx, gitExecutable, repository.Path, 64<<10,
+		"remote", "get-url", "origin")
+	if err != nil {
+		return commandFailure("revalidate repository origin", stdout, stderr, err)
+	}
+	identity, err := normalizeRemoteIdentity(strings.TrimSpace(string(stdout)), repository.Path)
+	if err != nil {
+		return fmt.Errorf("revalidate repository origin: %w", err)
+	}
+	if !sameRemoteIdentity(identity, repository.RemoteIdentity) {
+		return errors.New("repository origin changed since worker registration")
+	}
+	return nil
+}
+
+func validateBaseBranch(
+	ctx context.Context,
+	gitExecutable string,
+	repository Repository,
+	branch string,
+) error {
+	if branch == "HEAD" || strings.HasPrefix(branch, "refs/") || strings.HasPrefix(branch, "origin/") {
+		return errors.New("base_branch must be a short branch name such as main or release/2026.07")
+	}
+	stdout, stderr, err := runGitCommand(ctx, gitExecutable, repository.Path, 64<<10,
+		"check-ref-format", "refs/heads/"+branch)
+	if err != nil {
+		return commandFailure("validate base_branch", stdout, stderr, err)
+	}
+	return nil
+}
+
+func discoverRemoteDefaultBranch(
+	ctx context.Context,
+	gitExecutable string,
+	repository Repository,
+) (string, string, error) {
+	stdout, stderr, err := runGitCommand(ctx, gitExecutable, repository.Path, 64<<10,
+		"ls-remote", "--symref", "origin", "HEAD")
+	if err != nil {
+		return "", "", commandFailure("discover origin default branch", stdout, stderr, err)
+	}
+	var branch, commit string
+	for _, line := range strings.Split(string(stdout), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 3 && fields[0] == "ref:" && fields[2] == "HEAD" {
+			if value, found := strings.CutPrefix(fields[1], "refs/heads/"); found {
+				branch = value
+			}
+		} else if len(fields) == 2 && fields[1] == "HEAD" && commitPattern.MatchString(fields[0]) {
+			commit = fields[0]
+		}
+	}
+	if branch == "" || commit == "" {
+		return "", "", errors.New("origin did not advertise a default branch; set base_branch for this repository")
+	}
+	return branch, commit, nil
+}
+
+func remoteBranchCommit(
+	ctx context.Context,
+	gitExecutable string,
+	repository Repository,
+	branch string,
+) (string, error) {
+	stdout, stderr, err := runGitCommand(ctx, gitExecutable, repository.Path, 64<<10,
+		"ls-remote", "--refs", "origin", "refs/heads/"+branch)
+	if err != nil {
+		return "", commandFailure("resolve base branch origin/"+branch, stdout, stderr, err)
+	}
+	fields := strings.Fields(string(stdout))
+	if len(fields) != 2 || fields[1] != "refs/heads/"+branch || !commitPattern.MatchString(fields[0]) {
+		return "", errors.New("base branch origin/" + branch + " does not exist")
+	}
+	return fields[0], nil
 }
 
 func addPreparedWorktree(ctx context.Context, gitExecutable string, repository Repository, value worktree) error {
@@ -325,88 +457,6 @@ func listGitWorktrees(ctx context.Context, gitExecutable, repository string) ([]
 		entries = append(entries, current)
 	}
 	return entries, nil
-}
-
-func cleanupSuccessfulWorktree(ctx context.Context, gitExecutable, root string, repository Repository, value worktree) error {
-	root, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return fmt.Errorf("canonicalize worktree root: %w", err)
-	}
-	path, err := filepath.EvalSymlinks(value.Path)
-	if err != nil {
-		return fmt.Errorf("canonicalize worktree path: %w", err)
-	}
-	relative, err := filepath.Rel(root, path)
-	if err != nil || relative == "." || relative == ".." ||
-		strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
-		return errors.New("worktree is outside the Factory worktree root")
-	}
-	if strings.Contains(relative, string(filepath.Separator)) {
-		return errors.New("worktree is not a direct child of the Factory worktree root")
-	}
-	stdout, stderr, err := runGitCommand(ctx, gitExecutable, path, 1<<20, "status", "--porcelain=v1", "-z")
-	if err != nil {
-		return commandFailure("inspect worktree status", stdout, stderr, err)
-	}
-	if len(stdout) != 0 {
-		return errors.New("worktree is dirty")
-	}
-	stdout, stderr, err = runGitCommand(ctx, gitExecutable, path, 64<<10, "rev-parse", "HEAD")
-	if err != nil {
-		return commandFailure("resolve worktree HEAD", stdout, stderr, err)
-	}
-	value.HeadCommit = strings.TrimSpace(string(stdout))
-	if !commitPattern.MatchString(value.HeadCommit) {
-		return errors.New("worktree HEAD is not a full commit ID")
-	}
-	if value.HeadCommit != value.BaseCommit {
-		stdout, stderr, err = runGitCommand(ctx, gitExecutable, path, 256<<10,
-			"for-each-ref", "--format=%(refname)", "--contains", value.HeadCommit, "refs/remotes")
-		if err != nil {
-			return commandFailure("inspect published refs", stdout, stderr, err)
-		}
-		if strings.TrimSpace(string(stdout)) == "" {
-			return errors.New("worktree contains unpublished commits")
-		}
-	}
-	entries, err := listGitWorktrees(ctx, gitExecutable, repository.Path)
-	if err != nil {
-		return err
-	}
-	matches := 0
-	for _, entry := range entries {
-		entryPath, err := filepath.EvalSymlinks(entry.Path)
-		if err != nil {
-			continue
-		}
-		if entryPath == path {
-			matches++
-			if entry.Branch != value.Branch || entry.Head != value.HeadCommit {
-				return errors.New("Git worktree identity does not match the live attempt")
-			}
-		}
-	}
-	if matches != 1 {
-		return fmt.Errorf("expected one registered Git worktree, found %d", matches)
-	}
-	stdout, stderr, err = runGitCommand(ctx, gitExecutable, repository.Path, 256<<10, "worktree", "remove", path)
-	if err != nil {
-		return commandFailure("remove successful worktree", stdout, stderr, err)
-	}
-	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
-		return errors.New("Git reported cleanup success but the worktree path remains")
-	}
-	entries, err = listGitWorktrees(ctx, gitExecutable, repository.Path)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		entryPath, err := filepath.Abs(entry.Path)
-		if err == nil && entryPath == path {
-			return errors.New("Git reported cleanup success but the worktree registration remains")
-		}
-	}
-	return nil
 }
 
 func runGitCommand(

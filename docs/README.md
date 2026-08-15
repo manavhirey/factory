@@ -9,8 +9,13 @@ Start with the root [README](../README.md) to run Factory.
 - [Local guide](local.md): build, configure, start, delegate, and troubleshoot.
 - [Worker contract](worker.md): identity, runtimes, claiming, process safety,
   and worktree cleanup.
-- [Issue poller](poller.md): GitHub queues, provider command adapters,
-  deduplication, and operation.
+- [Remote VM Workers](remote-workers.md): TLS listener, one-time enrollment,
+  authentication, and reconnect behavior.
+- [Routines and Work](routines/design.md): implemented authoring, manual and
+  scheduled Work across repositories, lifecycle, and migration decisions.
+- [Release guide](release.md): install, verify, upgrade, roll back, reproduce,
+  and publish tagged releases.
+- [Changelog](../CHANGELOG.md): user-visible changes and compatibility notes.
 - [Security policy](../SECURITY.md): reporting and the current trust model.
 - [Contributing](../CONTRIBUTING.md): setup, checks, and pull request standards.
 
@@ -22,13 +27,39 @@ Start with the root [README](../README.md) to run Factory.
 - [Calculator plugin A/B plan](plans/2026-07-31-calculator-plugin-ab-evaluation.md):
   matched control/treatment design for the first `dotnet-quality` evaluation.
 
-## Proposed designs
+## Project operations
 
-These documents describe work that is not implemented:
+- [Repository best-practices setup](resources/github/01-repository-best-practices.md):
+  pasteable prompt for a safe, documented, agent-ready GitHub repository.
+- [Issue-tracker setup](resources/github/02-issue-tracker.md): pasteable prompt
+  for issue forms, labels, and a GitHub Project delivery board.
 
-- [Reusable workflows and automations](workflows/design.md)
-- [Advanced GitHub ingest design](github-ingest/design.md)
-- [Unified CLI](cli/design.md)
+## Active design work
+
+- [Cloud Run agent backend](cloud-run-agents/design.md): proposed elastic,
+  API-backed execution alongside persistent local and VM Workers.
+- [Software Factory vision](software-factory/vision.md): product thesis, scope,
+  principles, and measures of progress.
+
+## Design records and superseded proposals
+
+- [Scheduled Automations](scheduled-automations.md): superseded operator guide
+  for removed Definitions, Automations, and Definition Runs.
+- [Product model upgrade](product-upgrade.md): completed migration record for
+  converting supported legacy Definitions and Runs into Routines and Work.
+- [External GitHub ingest](github-ingest/design.md): replaced by control-plane
+  typed Automations, then superseded by the target architecture.
+- [Retired GitHub webhook settings](github-webhooks.md): upgrade note for the
+  webhook listener removed with Definitions and Automations.
+- [Reusable workflows and automations](workflows/design.md): design record for
+  the implemented Workflow and typed Automation slices; superseded by Routines
+  and Work.
+- [Coding automation experience](automation-experience/design.md): implemented
+  Runbook-first UX record, superseded by Routines and Work.
+- [Software Factory target architecture](software-factory/design.md): proposed
+  Definitions, Triggers, Runs, and Jobs, superseded by Routines and Work.
+- [Unified CLI](cli/design.md): useful process-boundary record whose resource
+  names and command contract must be revised against Routines and Work.
 
 Current behavior belongs in the root `ARCHITECTURE.md`. Proposed behavior belongs
 in a focused design until it is implemented.

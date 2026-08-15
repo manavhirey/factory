@@ -30,16 +30,22 @@ func TestPluginActivationUsesExplicitCodexHomeWithoutUserHome(t *testing.T) {
 
 func TestEmptyPluginSetPreservesPromptBytes(t *testing.T) {
 	claim := protocol.Claim{
-		Task:       protocol.Task{Title: "Build calculator", Description: "Implement the approved spec."},
+		Target: protocol.ClaimedWorkTarget{
+			RoutineName: "Build calculator",
+			Prompt:      "Implement the approved spec.",
+		},
 		Repository: protocol.Repository{RemoteIdentity: "example.invalid/calculator"},
 	}
+	value := worktree{Branch: "factory/work", BaseBranch: "main"}
 	want := "You are running in a Factory managed Git worktree.\n" +
-		"Work only on the assigned task and repository. Preserve unrelated changes and do not touch Factory state or unrelated worktrees. " +
-		"and do not delete worktrees or branches. Complete and verify the task before returning a concise result.\n\n" +
-		"Task title: Build calculator\n" +
-		"Repository: example.invalid/calculator\n\n" +
+		"Work only on the assigned Work and repository. Preserve unrelated changes and do not touch Factory state or unrelated worktrees. " +
+		"Do not switch, create, rename, or delete branches or worktrees. Complete and verify the Work before returning a concise result.\n\n" +
+		"Routine: Build calculator\n" +
+		"Repository: example.invalid/calculator\n" +
+		"Working branch: factory/work\n" +
+		"Target base branch: main\n\n" +
 		"Implement the approved spec."
-	if got := buildPrompt(claim, []Plugin{}); got != want {
+	if got := buildPrompt(claim, value, nil); got != want {
 		t.Fatalf("control prompt changed:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
 }
@@ -64,18 +70,29 @@ func TestLoadPluginsSortsAndComposesDeterministicContext(t *testing.T) {
 		t.Fatalf("plugin identities = %#v, want %#v", got, want)
 	}
 	claim := protocol.Claim{
-		Task:       protocol.Task{Title: "Task", Description: "Description"},
+		Target:     protocol.ClaimedWorkTarget{RoutineName: "Task", Prompt: "Description"},
 		Repository: protocol.Repository{RemoteIdentity: "example.invalid/repo"},
 	}
-	prompt := buildPrompt(claim, plugins)
+	prompt := buildPrompt(claim, worktree{Branch: "factory/work", BaseBranch: "main"}, plugins)
 	aIndex := strings.Index(prompt, "BEGIN FACTORY PLUGIN a-review@0.1.0")
 	zIndex := strings.Index(prompt, "BEGIN FACTORY PLUGIN z-review@1.2.0")
-	taskIndex := strings.Index(prompt, "Task title: Task")
+	taskIndex := strings.Index(prompt, "Routine: Task")
 	if aIndex < 0 || zIndex <= aIndex || taskIndex <= zIndex {
 		t.Fatalf("plugin prompt ordering is not deterministic:\n%s", prompt)
 	}
 	if !strings.Contains(prompt, "A prompt") || !strings.Contains(prompt, "Z prompt") {
 		t.Fatalf("plugin prompt content missing:\n%s", prompt)
+	}
+}
+
+func TestPluginsForRuntimeSelectsOnlyCompatiblePlugins(t *testing.T) {
+	plugins := []Plugin{
+		{ID: "a-review", Version: "1.0.0", Runtime: protocol.RuntimeCodex},
+		{ID: "b-review", Version: "1.0.0", Runtime: protocol.RuntimeClaudeCode},
+	}
+	got := pluginIdentities(pluginsForRuntime(plugins, protocol.RuntimeCodex))
+	if want := []string{"a-review@1.0.0"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Codex plugin identities = %#v, want %#v", got, want)
 	}
 }
 
@@ -191,6 +208,33 @@ func TestPluginDependencyHealthIsRechecked(t *testing.T) {
 	}
 }
 
+func TestManagerHealthBecomesUnhealthyWhenPluginSemanticProbeFails(t *testing.T) {
+	t.Setenv("FACTORY_MCP_PROBE_HELPER", "1")
+	codexPath := filepath.Join(t.TempDir(), "codex")
+	writeFakeCodex(t, codexPath)
+	manager := &Manager{
+		config: Config{Runtime: protocol.RuntimeCodex, Runtimes: []string{protocol.RuntimeCodex}},
+		options: Options{
+			GitExecutable:      "git",
+			GitHubExecutable:   filepath.Join(t.TempDir(), "missing-gh"),
+			RuntimeExecutables: map[string]string{protocol.RuntimeCodex: codexPath},
+		},
+		plugins: []Plugin{{
+			ID: "dotnet-quality",
+			HealthChecks: []PluginHealthCheck{{
+				Command: os.Args[0], Arguments: []string{"-test.run=TestMCPProbeHelperProcess", "--", "tool-error"},
+				RequiredTools: []string{"find_symbol"}, SemanticTool: "find_symbol",
+				SemanticArgs: json.RawMessage(`{"name":"ReviewerHealthMarker"}`), ExpectedResult: "ReviewerHealthMarker",
+				StartupTimeout: 2,
+			}},
+		}},
+	}
+	value := manager.checkHealth(context.Background())
+	if value.State != "unhealthy" || value.Error == nil || !strings.Contains(value.Error.Error(), "isError=true") {
+		t.Fatalf("manager plugin health = %#v", value)
+	}
+}
+
 func TestBundledDotnetQualityPluginLoads(t *testing.T) {
 	sourceRoot, err := filepath.Abs(filepath.Join("..", "..", "plugins", "dotnet-quality"))
 	if err != nil {
@@ -201,6 +245,10 @@ func TestBundledDotnetQualityPluginLoads(t *testing.T) {
 	copyTestDirectory(t, sourceRoot, filepath.Join(root, "dotnet-quality"))
 	artifactRoot := t.TempDir()
 	secureTestDirectory(t, artifactRoot)
+	artifactRoot, err = secureDirectory(artifactRoot, "plugin artifact directory")
+	if err != nil {
+		t.Fatal(err)
+	}
 	wantedExecutable := filepath.Join(artifactRoot, "dotnet-quality", "CWM.RoslynNavigator.0.8.0", "tools", "net10.0", "any", "CWM.RoslynNavigator.dll")
 	replaceFile(t, filepath.Join(root, "dotnet-quality", "codex", "agents", "dotnet-quality-reviewer.toml"),
 		"/opt/factory/plugin-artifacts/dotnet-quality/CWM.RoslynNavigator.0.8.0/tools/net10.0/any/CWM.RoslynNavigator.dll", wantedExecutable)
@@ -611,7 +659,7 @@ func TestMCPProbeHelperProcess(t *testing.T) {
 		return
 	}
 	if mode == "timeout" {
-		select {}
+		time.Sleep(60 * time.Second)
 	}
 	decoder := json.NewDecoder(os.Stdin)
 	encoder := json.NewEncoder(os.Stdout)
@@ -753,13 +801,31 @@ func TestMCPProbeChildProcess(t *testing.T) {
 		os.Exit(2)
 	}
 	_ = os.WriteFile(os.Getenv("FACTORY_MCP_CHILD_PID_FILE"), []byte(fmt.Sprintf("%d", command.Process.Pid)), 0o600)
-	select {}
+	time.Sleep(60 * time.Second)
 }
 
 func TestManifestRejectsUnsortedPluginEvidence(t *testing.T) {
 	dataDirectory := t.TempDir()
-	workerID := fixtureUUID(1)
-	manifest := fixtureManifest(dataDirectory, workerID, 10)
+	workerID := "00000000-0000-4000-8000-000000000001"
+	targetID := "00000000-0000-4000-8000-000000000011"
+	attemptID := "00000000-0000-4000-8000-000000000012"
+	manifest := attemptManifest{
+		SchemaVersion:  manifestSchemaVersion,
+		WorkerID:       workerID,
+		WorkTargetID:   targetID,
+		ExecutionID:    "00000000-0000-4000-8000-000000000013",
+		AttemptID:      attemptID,
+		RepositoryID:   "00000000-0000-4000-8000-000000000014",
+		RepositoryKey:  "factory",
+		RepositoryPath: filepath.Join(dataDirectory, "source"),
+		RemoteIdentity: "example.invalid/factory",
+		BaseCommit:     strings.Repeat("a", 40),
+		WorktreePath:   filepath.Join(dataDirectory, "worktrees", attemptID),
+		Branch:         "factory/" + targetID[:12] + "-" + attemptID[:12],
+		Lifecycle:      manifestPreparing,
+		CreatedAt:      time.Unix(100, 0).UTC(),
+		UpdatedAt:      time.Unix(100, 0).UTC(),
+	}
 	manifest.ActivePlugins = []string{"z-review@1.0.0", "a-review@1.0.0"}
 	if err := newManifestStore(dataDirectory, workerID).validate(manifest); err == nil ||
 		!strings.Contains(err.Error(), "unique and sorted") {

@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const manifestSchemaVersion = 1
+const manifestSchemaVersion = 2
 const disposalJournalSchemaVersion = 1
 
 const (
@@ -39,15 +39,16 @@ const (
 type attemptManifest struct {
 	SchemaVersion int `json:"schema_version"`
 
-	WorkerID    string `json:"worker_id"`
-	TaskID      string `json:"task_id"`
-	ExecutionID string `json:"execution_id"`
-	AttemptID   string `json:"attempt_id"`
+	WorkerID     string `json:"worker_id"`
+	WorkTargetID string `json:"work_target_id"`
+	ExecutionID  string `json:"execution_id"`
+	AttemptID    string `json:"attempt_id"`
 
 	RepositoryID   string   `json:"repository_id"`
 	RepositoryKey  string   `json:"repository_key"`
 	RepositoryPath string   `json:"repository_path"`
 	RemoteIdentity string   `json:"remote_identity"`
+	BaseBranch     string   `json:"base_branch,omitempty"`
 	BaseCommit     string   `json:"base_commit"`
 	WorktreePath   string   `json:"worktree_path"`
 	Branch         string   `json:"branch"`
@@ -67,6 +68,11 @@ type attemptManifest struct {
 	CleanupResult   string    `json:"cleanup_result,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+type attemptManifestV1 struct {
+	attemptManifest
+	TaskID string `json:"task_id"`
 }
 
 type disposalJournal struct {
@@ -461,10 +467,24 @@ func (store *manifestStore) readLocked(path string) (attemptManifest, error) {
 	if err != nil {
 		return attemptManifest{}, fmt.Errorf("read attempt manifest: %w", err)
 	}
+	var manifest attemptManifest
+	var header struct {
+		SchemaVersion int `json:"schema_version"`
+	}
+	if err := json.Unmarshal(body, &header); err != nil {
+		return attemptManifest{}, fmt.Errorf("decode attempt manifest header: %w", err)
+	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
-	var manifest attemptManifest
-	if err := decoder.Decode(&manifest); err != nil {
+	if header.SchemaVersion == 1 {
+		var legacy attemptManifestV1
+		if err := decoder.Decode(&legacy); err != nil {
+			return attemptManifest{}, fmt.Errorf("decode version 1 attempt manifest: %w", err)
+		}
+		manifest = legacy.attemptManifest
+		manifest.SchemaVersion = manifestSchemaVersion
+		manifest.WorkTargetID = legacy.TaskID
+	} else if err := decoder.Decode(&manifest); err != nil {
 		return attemptManifest{}, fmt.Errorf("decode attempt manifest: %w", err)
 	}
 	var trailing any
@@ -573,7 +593,7 @@ func (store *manifestStore) validate(manifest attemptManifest) error {
 		return fmt.Errorf("unsupported attempt manifest schema version %d", manifest.SchemaVersion)
 	}
 	for name, value := range map[string]string{
-		"worker_id": manifest.WorkerID, "task_id": manifest.TaskID,
+		"worker_id": manifest.WorkerID, "work_target_id": manifest.WorkTargetID,
 		"execution_id": manifest.ExecutionID, "attempt_id": manifest.AttemptID,
 		"repository_id": manifest.RepositoryID,
 	} {
@@ -605,10 +625,10 @@ func (store *manifestStore) validate(manifest attemptManifest) error {
 	if manifest.WorktreePath != expectedPath {
 		return errors.New("attempt manifest worktree path is not the owned Factory path")
 	}
-	expectedBranch := "factory/" + manifest.TaskID[:12] + "-" + manifest.AttemptID[:12]
-	previewBranch := "factory-v2/" + manifest.TaskID[:12] + "-" + manifest.AttemptID[:12]
+	expectedBranch := "factory/" + manifest.WorkTargetID[:12] + "-" + manifest.AttemptID[:12]
+	previewBranch := "factory-v2/" + manifest.WorkTargetID[:12] + "-" + manifest.AttemptID[:12]
 	if manifest.Branch != expectedBranch && manifest.Branch != previewBranch {
-		return errors.New("attempt manifest branch does not match its task and attempt")
+		return errors.New("attempt manifest branch does not match its Work target and attempt")
 	}
 	allowedLifecycle := map[string]bool{
 		manifestPreparing: true, manifestWorktreeCreated: true, manifestSupervisorReady: true,

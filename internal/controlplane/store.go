@@ -14,8 +14,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
-	"unicode/utf8"
 
 	"github.com/owainlewis/factory/internal/protocol"
 	"github.com/owainlewis/factory/migrations"
@@ -55,18 +55,45 @@ type Store struct {
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
+	return openStore(ctx, path, false)
+}
+
+func openExistingStore(ctx context.Context, path string) (*Store, error) {
+	return openStore(ctx, path, true)
+}
+
+func openStore(ctx context.Context, path string, existingOnly bool) (*Store, error) {
 	if path == "" {
 		return nil, errors.New("database path is required")
 	}
+	if existingOnly && path == ":memory:" {
+		return nil, errors.New("existing database path is required")
+	}
 	if path != ":memory:" {
-		if err := prepareDatabasePath(path); err != nil {
+		if existingOnly {
+			info, err := os.Lstat(path)
+			if err != nil {
+				return nil, fmt.Errorf("inspect existing database: %w", err)
+			}
+			if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+				return nil, fmt.Errorf("database must be a regular non-symlink file: %s", path)
+			}
+		}
+		preparedPath, err := prepareDatabasePath(path)
+		if err != nil {
 			return nil, err
 		}
+		path = preparedPath
 	}
 
 	dsn := "file::memory:?cache=shared"
 	if path != ":memory:" {
 		u := &url.URL{Scheme: "file", Path: path}
+		if existingOnly {
+			query := u.Query()
+			query.Set("mode", "rw")
+			u.RawQuery = query.Encode()
+		}
 		dsn = u.String()
 		if strings.Contains(dsn, "?") {
 			dsn += "&"
@@ -89,30 +116,215 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if path != ":memory:" {
+		if err := restrictDatabaseFilePermissions(path); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
 	return store, nil
 }
 
-func prepareDatabasePath(path string) error {
+func prepareDatabasePath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve database path: %w", err)
+	}
+	directory := filepath.Dir(absolute)
+	existingDirectory, err := deepestExistingDirectory(directory)
+	if err != nil {
+		return "", err
+	}
+	effectiveUID := uint32(os.Geteuid())
+	if err := validateConfiguredDatabaseDirectoryChain(
+		existingDirectory,
+		effectiveUID,
+		existingDirectory == directory,
+	); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return "", fmt.Errorf("create database directory: %w", err)
+	}
+	if err := validateConfiguredDatabaseDirectoryChain(directory, effectiveUID, true); err != nil {
+		return "", err
+	}
+	directory, err = filepath.EvalSymlinks(directory)
+	if err != nil {
+		return "", fmt.Errorf("canonicalize database directory: %w", err)
+	}
+	if err := validateDatabaseDirectory(directory, effectiveUID); err != nil {
+		return "", err
+	}
+	path = filepath.Join(directory, filepath.Base(absolute))
 	info, err := os.Lstat(path)
 	exists := err == nil
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect database: %w", err)
+		return "", fmt.Errorf("inspect database: %w", err)
 	}
 	if exists && !info.Mode().IsRegular() {
-		return fmt.Errorf("database must be a regular non-symlink file: %s", path)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create database directory: %w", err)
+		return "", fmt.Errorf("database must be a regular non-symlink file: %s", path)
 	}
 	marker := path + ".v2-control-plane"
 	if exists {
-		return validateDatabaseMarker(marker)
+		if err := validateDatabaseMarker(marker); err != nil {
+			return "", err
+		}
+		if err := restrictDatabaseFilePermissions(path); err != nil {
+			return "", err
+		}
+		return path, nil
 	}
 	err = createDatabaseMarker(marker)
 	if errors.Is(err, os.ErrExist) {
-		return validateDatabaseMarker(marker)
+		if err := validateDatabaseMarker(marker); err != nil {
+			return "", err
+		}
+	} else if err != nil {
+		return "", err
 	}
-	return err
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("create Factory database with owner-only permissions: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return "", fmt.Errorf("close new Factory database: %w", err)
+	}
+	if err := restrictDatabaseFilePermissions(path); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func deepestExistingDirectory(path string) (string, error) {
+	for {
+		_, err := os.Lstat(path)
+		if err == nil {
+			return path, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("inspect database path directory %s: %w", path, err)
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return "", fmt.Errorf("database path has no existing ancestor: %s", path)
+		}
+		path = parent
+	}
+}
+
+func validateDatabaseDirectory(path string, effectiveUID uint32) error {
+	return validateDatabaseDirectoryChain(path, effectiveUID, true)
+}
+
+func validateConfiguredDatabaseDirectoryChain(path string, effectiveUID uint32, firstIsDatabaseDirectory bool) error {
+	configuredDirectory := path
+	for {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("inspect configured database path directory %s: %w", path, err)
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fmt.Errorf("inspect configured database path owner: unsupported file metadata for %s", path)
+		}
+		if stat.Uid != effectiveUID && stat.Uid != 0 {
+			return fmt.Errorf("configured database path must be owned by effective user %d or root: %s", effectiveUID, path)
+		}
+		isSymlink := info.Mode()&os.ModeSymlink != 0
+		if !isSymlink && !info.IsDir() {
+			return fmt.Errorf("configured database path component must be a directory or trusted symlink: %s", path)
+		}
+		if !isSymlink && (!firstIsDatabaseDirectory || path != configuredDirectory) &&
+			info.Mode().Perm()&0o022 != 0 && info.Mode()&os.ModeSticky == 0 {
+			return fmt.Errorf(
+				"configured database path ancestor must not be group or world writable unless protected by the sticky bit: %s has mode %#o",
+				path,
+				info.Mode().Perm(),
+			)
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return nil
+		}
+		path = parent
+	}
+}
+
+func validateDatabaseDirectoryChain(path string, effectiveUID uint32, requireDatabaseDirectory bool) error {
+	databaseDirectory := path
+	for {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("inspect database path directory %s: %w", path, err)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("database path must use real non-symlink directories: %s", path)
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fmt.Errorf("inspect database path directory owner: unsupported file metadata for %s", path)
+		}
+		if requireDatabaseDirectory && path == databaseDirectory {
+			if stat.Uid != effectiveUID {
+				return fmt.Errorf("database directory must be owned by effective user %d: %s", effectiveUID, path)
+			}
+			if info.Mode().Perm()&0o022 != 0 {
+				return fmt.Errorf(
+					"database directory must not be writable by group or other users: %s has mode %#o; run chmod go-w %q",
+					path,
+					info.Mode().Perm(),
+					path,
+				)
+			}
+		} else {
+			if stat.Uid != effectiveUID && stat.Uid != 0 {
+				return fmt.Errorf("database path ancestor must be owned by effective user %d or root: %s", effectiveUID, path)
+			}
+			if info.Mode().Perm()&0o022 != 0 && info.Mode()&os.ModeSticky == 0 {
+				return fmt.Errorf(
+					"database path ancestor must not be group or world writable unless protected by the sticky bit: %s has mode %#o",
+					path,
+					info.Mode().Perm(),
+				)
+			}
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return nil
+		}
+		path = parent
+	}
+}
+
+func restrictDatabaseFilePermissions(path string) error {
+	for _, file := range []struct {
+		path     string
+		name     string
+		required bool
+	}{
+		{path: path, name: "database", required: true},
+		{path: path + "-wal", name: "database WAL", required: false},
+		{path: path + "-shm", name: "database shared-memory file", required: false},
+	} {
+		info, err := os.Lstat(file.path)
+		if errors.Is(err, os.ErrNotExist) && !file.required {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect %s permissions: %w", file.name, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("%s must be a regular non-symlink file: %s", file.name, file.path)
+		}
+		if info.Mode().Perm() == 0o600 {
+			continue
+		}
+		if err := os.Chmod(file.path, 0o600); err != nil {
+			return fmt.Errorf("restrict %s permissions to owner-only access: %w", file.name, err)
+		}
+	}
+	return nil
 }
 
 type databaseMarkerFile interface {
@@ -168,10 +380,22 @@ func cleanFailedDatabaseMarker(file databaseMarkerFile, marker string, cause err
 }
 
 func validateDatabaseMarker(marker string) error {
-	body, err := os.ReadFile(marker)
+	info, err := os.Lstat(marker)
 	if errors.Is(err, os.ErrNotExist) {
 		return errors.New("refusing an existing database without the Factory control-plane marker")
 	}
+	if err != nil {
+		return fmt.Errorf("inspect Factory database marker: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("refusing an existing database with a non-regular Factory control-plane marker")
+	}
+	if info.Mode().Perm() != 0o600 {
+		if err := os.Chmod(marker, 0o600); err != nil {
+			return fmt.Errorf("restrict Factory database marker permissions to owner-only access: %w", err)
+		}
+	}
+	body, err := os.ReadFile(marker)
 	if err != nil {
 		return fmt.Errorf("read Factory database marker: %w", err)
 	}
@@ -265,7 +489,10 @@ func (s *Store) applyForeignKeyRebuildMigration(
 	if err != nil {
 		return fmt.Errorf("begin migration %s: %w", name, err)
 	}
-	if _, err = tx.ExecContext(ctx, string(body)); err == nil {
+	if _, err = tx.ExecContext(ctx, string(body)); err == nil && name == "027_routines_work.sql" {
+		err = normalizeMigratedRoutineTitleKeys(ctx, tx)
+	}
+	if err == nil {
 		var rows *sql.Rows
 		rows, err = tx.QueryContext(ctx, `PRAGMA foreign_key_check`)
 		if err == nil {
@@ -547,6 +774,298 @@ func (s *Store) ManagedRepository(ctx context.Context, repositoryID string) (pro
 	return repository, nil
 }
 
+type managedRepositoryEligibility struct {
+	online             bool
+	health             string
+	githubAccess       bool
+	acceptsManaged     bool
+	cached             bool
+	advertised         bool
+	reserved           bool
+	displayKeyConflict bool
+	cacheUse           int
+	retentionUse       int
+}
+
+func evaluateManagedRepositoryEligibility(
+	repository protocol.ManagedRepository,
+	state managedRepositoryEligibility,
+) (bool, string) {
+	switch {
+	case !repository.Enabled:
+		return false, "Repository routing is disabled."
+	case !state.advertised && !isManagedGitHubRemote(repository.RemoteIdentity):
+		return false, "Repository source is not supported for managed acquisition."
+	case !state.online:
+		return false, "Worker is offline."
+	case state.health != "healthy":
+		return false, "Worker is unhealthy."
+	case !state.githubAccess:
+		return false, "Worker does not currently report GitHub access."
+	case !state.advertised && state.displayKeyConflict:
+		return false, "Another advertised repository uses this routing identity."
+	case !state.advertised && !state.acceptsManaged:
+		return false, "Worker cannot acquire managed repositories and does not advertise this one."
+	case !state.advertised && !state.cached && !state.reserved && state.cacheUse >= protocol.MaxRepositoryCacheEntries:
+		return false, "Managed repository cache and reservations are full."
+	case state.retentionUse >= protocol.MaxRetainedPerRepo:
+		return false, "Repository retained-worktree capacity is full."
+	case state.cached:
+		return true, "Online, healthy, with GitHub access and this repository cached."
+	case state.advertised:
+		return true, "Online, healthy, with GitHub access and this repository advertised."
+	case state.reserved:
+		return true, "Online, healthy, with GitHub access and this repository already reserved."
+	default:
+		return true, "Online, healthy, with GitHub access and managed cache headroom."
+	}
+}
+
+func isManagedGitHubRemote(remoteIdentity string) bool {
+	_, err := normalizeManagedGitHubRemote(remoteIdentity)
+	return err == nil
+}
+
+func (s *Store) WorkerRepositoryOptions(
+	ctx context.Context,
+	workerID string,
+) ([]protocol.WorkerRepositoryOption, error) {
+	workerID = strings.TrimSpace(workerID)
+	var health string
+	var heartbeat int64
+	var encodedSourceAccess, encodedManagedRepositoryIDs []byte
+	var acceptsManaged, cacheUse int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT health, last_heartbeat, source_access_json, managed_repository_ids_json,
+		       accepts_managed_repositories,
+		       json_array_length(managed_repository_ids_json) + (
+		           SELECT COUNT(*)
+		           FROM worker_repositories reserved
+		           WHERE reserved.worker_id = workers.id
+		             AND reserved.dynamic = 1
+		             AND reserved.advertised = 1
+		             AND NOT EXISTS (
+		                 SELECT 1 FROM json_each(workers.managed_repository_ids_json) cached
+		                 WHERE cached.value = reserved.repository_id
+		             )
+		       )
+		FROM workers WHERE id = ?
+	`, workerID).Scan(
+		&health, &heartbeat, &encodedSourceAccess, &encodedManagedRepositoryIDs,
+		&acceptsManaged, &cacheUse,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, unavailable(err)
+	}
+	var sourceAccess []protocol.SourceAccess
+	if err := json.Unmarshal(encodedSourceAccess, &sourceAccess); err != nil {
+		return nil, unavailable(err)
+	}
+	var managedRepositoryIDs []string
+	if err := json.Unmarshal(encodedManagedRepositoryIDs, &managedRepositoryIDs); err != nil {
+		return nil, unavailable(err)
+	}
+	cachedRepositoryIDs := make(map[string]struct{}, len(managedRepositoryIDs))
+	for _, repositoryID := range managedRepositoryIDs {
+		cachedRepositoryIDs[repositoryID] = struct{}{}
+	}
+	baseState := managedRepositoryEligibility{
+		online:         s.now().Sub(fromMillis(heartbeat)) <= protocol.WorkerOnlineWindow,
+		health:         health,
+		githubAccess:   hasSourceAccess(sourceAccess, protocol.SourceAccess{Provider: "github", Hostname: "github.com"}),
+		acceptsManaged: acceptsManaged != 0,
+		cacheUse:       cacheUse,
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT repository.id, COALESCE(worker_repository.display_key, ''),
+		       repository.remote_identity, repository.enabled,
+		       CASE
+		           WHEN worker_repository.advertised = 1 AND worker_repository.dynamic = 0 THEN 1
+		           ELSE 0
+		       END,
+		       CASE
+		           WHEN worker_repository.advertised = 1 AND worker_repository.dynamic = 1 THEN 1
+		           ELSE 0
+		       END,
+		       EXISTS (
+		           SELECT 1 FROM worker_repositories conflict
+		           WHERE conflict.worker_id = ?
+		             AND conflict.display_key = repository.remote_identity
+		             AND conflict.repository_id != repository.id
+		       ),
+		       COALESCE(worker_repository.retained_count, 0) + (
+		           SELECT COUNT(*)
+		           FROM attempts active_attempt
+		           JOIN executions active_execution ON active_execution.id = active_attempt.execution_id
+		           JOIN work_targets active_target ON active_target.id = active_execution.work_target_id
+		           WHERE active_attempt.worker_id = ?
+		             AND active_target.repository_id = repository.id
+		             AND active_attempt.state IN ('preparing', 'running')
+		       ) + (
+		           SELECT COUNT(*)
+		           FROM attempts terminal_attempt
+		           JOIN executions terminal_execution ON terminal_execution.id = terminal_attempt.execution_id
+		           JOIN work_targets terminal_target ON terminal_target.id = terminal_execution.work_target_id
+		           WHERE terminal_attempt.worker_id = ?
+		             AND terminal_target.repository_id = repository.id
+		             AND terminal_attempt.state IN ('succeeded', 'failed', 'cancelled', 'lost')
+		             AND terminal_attempt.capacity_acknowledged = 0
+		       )
+		FROM repositories repository
+		LEFT JOIN worker_repositories worker_repository
+		  ON worker_repository.worker_id = ? AND worker_repository.repository_id = repository.id
+		ORDER BY repository.remote_identity
+	`, workerID, workerID, workerID, workerID)
+	if err != nil {
+		return nil, unavailable(err)
+	}
+	defer rows.Close()
+	options := make([]protocol.WorkerRepositoryOption, 0)
+	for rows.Next() {
+		var option protocol.WorkerRepositoryOption
+		var enabled, advertised, reserved, displayKeyConflict int
+		var retentionUse int
+		if err := rows.Scan(
+			&option.ID, &option.Key, &option.RemoteIdentity, &enabled,
+			&advertised, &reserved, &displayKeyConflict, &retentionUse,
+		); err != nil {
+			return nil, unavailable(err)
+		}
+		_, option.Cached = cachedRepositoryIDs[option.ID]
+		option.Enabled = enabled != 0
+		option.Advertised = advertised != 0
+		state := baseState
+		state.cached = option.Cached
+		state.advertised = option.Advertised
+		state.reserved = reserved != 0
+		state.displayKeyConflict = displayKeyConflict != 0
+		state.retentionUse = retentionUse
+		option.Ready, option.Reason = evaluateManagedRepositoryEligibility(
+			protocol.ManagedRepository{ID: option.ID, RemoteIdentity: option.RemoteIdentity, Enabled: option.Enabled},
+			state,
+		)
+		options = append(options, option)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, unavailable(err)
+	}
+	return options, nil
+}
+
+func (s *Store) ManagedRepositoryReadiness(
+	ctx context.Context,
+	repositoryID string,
+) (protocol.ManagedRepositoryReadiness, error) {
+	repository, err := s.ManagedRepository(ctx, repositoryID)
+	if err != nil {
+		return protocol.ManagedRepositoryReadiness{}, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT w.id, w.name, w.health, w.last_heartbeat, w.source_access_json,
+		       w.accepts_managed_repositories,
+		       EXISTS (
+		           SELECT 1 FROM json_each(w.managed_repository_ids_json) cached
+		           WHERE cached.value = ?
+		       ),
+		       COALESCE(wr.advertised, 0),
+		       EXISTS (
+		           SELECT 1 FROM worker_repositories conflict
+		           WHERE conflict.worker_id = w.id
+		             AND conflict.display_key = ?
+		             AND conflict.repository_id != ?
+		       ),
+		       json_array_length(w.managed_repository_ids_json) + (
+		           SELECT COUNT(*)
+		           FROM worker_repositories reserved
+		           WHERE reserved.worker_id = w.id
+		             AND reserved.dynamic = 1
+		             AND reserved.advertised = 1
+		             AND NOT EXISTS (
+		                 SELECT 1 FROM json_each(w.managed_repository_ids_json) cached
+		                 WHERE cached.value = reserved.repository_id
+		             )
+		       ),
+		       COALESCE(wr.retained_count, 0) + (
+		           SELECT COUNT(*)
+		           FROM attempts active_attempt
+		           JOIN executions active_execution ON active_execution.id = active_attempt.execution_id
+		           JOIN work_targets active_target ON active_target.id = active_execution.work_target_id
+		           WHERE active_attempt.worker_id = w.id
+		             AND active_target.repository_id = ?
+		             AND active_attempt.state IN ('preparing', 'running')
+		       ) + (
+		           SELECT COUNT(*)
+		           FROM attempts terminal_attempt
+		           JOIN executions terminal_execution ON terminal_execution.id = terminal_attempt.execution_id
+		           JOIN work_targets terminal_target ON terminal_target.id = terminal_execution.work_target_id
+		           WHERE terminal_attempt.worker_id = w.id
+		             AND terminal_target.repository_id = ?
+		             AND terminal_attempt.state IN ('succeeded', 'failed', 'cancelled', 'lost')
+		             AND terminal_attempt.capacity_acknowledged = 0
+		       )
+		FROM workers w
+		LEFT JOIN worker_repositories wr
+		  ON wr.worker_id = w.id AND wr.repository_id = ?
+		ORDER BY w.registered_at, w.id
+	`, repository.ID, repository.RemoteIdentity, repository.ID,
+		repository.ID, repository.ID, repository.ID)
+	if err != nil {
+		return protocol.ManagedRepositoryReadiness{}, unavailable(err)
+	}
+	defer rows.Close()
+
+	readiness := protocol.ManagedRepositoryReadiness{
+		Workers: make([]protocol.ManagedRepositoryWorkerReadiness, 0),
+	}
+	now := s.now()
+	for rows.Next() {
+		var worker protocol.ManagedRepositoryWorkerReadiness
+		var health string
+		var heartbeat int64
+		var encodedSourceAccess []byte
+		var acceptsManaged, cached, advertised, displayKeyConflict int
+		var cacheUse, retentionUse int
+		if err := rows.Scan(
+			&worker.ID, &worker.Name, &health, &heartbeat, &encodedSourceAccess,
+			&acceptsManaged, &cached, &advertised, &displayKeyConflict,
+			&cacheUse, &retentionUse,
+		); err != nil {
+			return protocol.ManagedRepositoryReadiness{}, unavailable(err)
+		}
+		var sourceAccess []protocol.SourceAccess
+		if err := json.Unmarshal(encodedSourceAccess, &sourceAccess); err != nil {
+			return protocol.ManagedRepositoryReadiness{}, unavailable(err)
+		}
+		worker.Cached = cached != 0
+		worker.Advertised = advertised != 0
+		worker.Ready, worker.Reason = evaluateManagedRepositoryEligibility(
+			repository,
+			managedRepositoryEligibility{
+				online:             now.Sub(fromMillis(heartbeat)) <= protocol.WorkerOnlineWindow,
+				health:             health,
+				githubAccess:       hasSourceAccess(sourceAccess, protocol.SourceAccess{Provider: "github", Hostname: "github.com"}),
+				acceptsManaged:     acceptsManaged != 0,
+				cached:             worker.Cached,
+				advertised:         worker.Advertised,
+				displayKeyConflict: displayKeyConflict != 0,
+				cacheUse:           cacheUse,
+				retentionUse:       retentionUse,
+			},
+		)
+		if worker.Ready {
+			readiness.RoutingReady = true
+		}
+		readiness.Workers = append(readiness.Workers, worker)
+	}
+	if err := rows.Err(); err != nil {
+		return protocol.ManagedRepositoryReadiness{}, unavailable(err)
+	}
+	return readiness, nil
+}
+
 func (s *Store) SetManagedRepositoryEnabled(
 	ctx context.Context,
 	repositoryID string,
@@ -554,7 +1073,33 @@ func (s *Store) SetManagedRepositoryEnabled(
 ) (protocol.ManagedRepository, error) {
 	repositoryID = strings.TrimSpace(repositoryID)
 	now := s.now().UnixMilli()
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return protocol.ManagedRepository{}, unavailable(err)
+	}
+	defer tx.Rollback()
+	var currentEnabled, centrallyManaged bool
+	err = tx.QueryRowContext(ctx, `SELECT enabled, centrally_managed FROM repositories WHERE id = ?`, repositoryID).Scan(&currentEnabled, &centrallyManaged)
+	if errors.Is(err, sql.ErrNoRows) {
+		return protocol.ManagedRepository{}, ErrNotFound
+	}
+	if err != nil {
+		return protocol.ManagedRepository{}, unavailable(err)
+	}
+	if currentEnabled == enabled {
+		if !centrallyManaged {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE repositories SET centrally_managed = 1, updated_at = ? WHERE id = ?
+			`, now, repositoryID); err != nil {
+				return protocol.ManagedRepository{}, unavailable(err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return protocol.ManagedRepository{}, unavailable(err)
+		}
+		return s.ManagedRepository(ctx, repositoryID)
+	}
+	result, err := tx.ExecContext(ctx, `
 		UPDATE repositories
 		SET enabled = ?, centrally_managed = 1, updated_at = ?
 		WHERE id = ?
@@ -568,6 +1113,43 @@ func (s *Store) SetManagedRepositoryEnabled(
 	}
 	if affected == 0 {
 		return protocol.ManagedRepository{}, ErrNotFound
+	}
+	if !enabled {
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM executions
+			WHERE state = 'queued' AND work_target_id IN (
+				SELECT id FROM work_targets WHERE repository_id = ? AND state = 'queued'
+			)
+		`, repositoryID); err != nil {
+			return protocol.ManagedRepository{}, unavailable(err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE work_targets SET state = 'blocked', assigned_worker_id = NULL,
+			       blocked_reason = 'Repository is disabled.'
+			WHERE repository_id = ? AND state = 'queued'
+		`, repositoryID); err != nil {
+			return protocol.ManagedRepository{}, unavailable(err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE routines SET schedule_health_status = 'blocked',
+			       schedule_health_code = 'repository_disabled',
+			       schedule_health_message = 'Enable every selected repository before the next occurrence can run.'
+			WHERE schedule_enabled = 1 AND id IN (
+				SELECT routine_id FROM routine_repositories WHERE repository_id = ?
+			)
+		`, repositoryID); err != nil {
+			return protocol.ManagedRepository{}, unavailable(err)
+		}
+	} else if _, err := tx.ExecContext(ctx, `
+		UPDATE routines SET schedule_health_status = 'healthy',
+		       schedule_health_code = '', schedule_health_message = ''
+		WHERE schedule_enabled = 1 AND pending_due_at IS NULL
+		  AND id IN (SELECT routine_id FROM routine_repositories WHERE repository_id = ?)
+	`, repositoryID); err != nil {
+		return protocol.ManagedRepository{}, unavailable(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return protocol.ManagedRepository{}, unavailable(err)
 	}
 	return s.ManagedRepository(ctx, repositoryID)
 }
@@ -655,6 +1237,21 @@ func (s *Store) resolveRepositoryAlias(ctx context.Context, repositoryID string)
 	return canonicalID, nil
 }
 
+func (s *Store) HeartbeatWorker(ctx context.Context, workerID string) (protocol.Worker, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE workers SET last_heartbeat = ? WHERE id = ?`, s.now().UnixMilli(), workerID)
+	if err != nil {
+		return protocol.Worker{}, unavailable(err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return protocol.Worker{}, unavailable(err)
+	}
+	if updated == 0 {
+		return protocol.Worker{}, ErrNotFound
+	}
+	return s.Worker(ctx, workerID)
+}
+
 func (s *Store) RegisterWorker(ctx context.Context, workerID string, input protocol.WorkerRegistration) (protocol.Worker, error) {
 	workerID = strings.TrimSpace(workerID)
 	if workerID == "" || len(workerID) > 200 {
@@ -664,22 +1261,49 @@ func (s *Store) RegisterWorker(ctx context.Context, workerID string, input proto
 	if input.Name == "" || len(input.Name) > 200 {
 		return protocol.Worker{}, invalid("invalid_worker", "worker name is required and must be at most 200 bytes")
 	}
+	if input.WorkClaimProtocolVersion != protocol.WorkClaimProtocolVersion {
+		return protocol.Worker{}, conflict(
+			"worker_upgrade_required",
+			"the Worker uses an incompatible Work claim protocol; upgrade it before reconnecting",
+		)
+	}
+	labels, err := normalizeWorkerLabels(input.Labels)
+	if err != nil {
+		return protocol.Worker{}, err
+	}
+	input.Labels = labels
 	input.Runtime = strings.TrimSpace(input.Runtime)
 	input.RuntimeVersion = strings.TrimSpace(input.RuntimeVersion)
 	if input.Runtime == "" {
 		input.Runtime = protocol.RuntimeCodex
 	}
 	if !protocol.SupportedRuntime(input.Runtime) {
-		return protocol.Worker{}, invalid("invalid_runtime", "runtime must be codex or claude-code")
+		return protocol.Worker{}, invalid("invalid_runtime", "runtime must be pi, codex, or claude-code")
 	}
 	if len(input.RuntimeVersion) > 1024 {
 		return protocol.Worker{}, invalid("invalid_runtime_version", "runtime_version must be at most 1024 bytes")
 	}
-	if input.Capacity < 1 || input.Capacity > 4 || input.ActiveCount < 0 || input.ActiveCount > input.Capacity {
-		return protocol.Worker{}, invalid("invalid_capacity", "capacity must be 1 through 4 and active_count cannot exceed it")
+	if input.Capacity < protocol.MinWorkerCapacity || input.Capacity > protocol.MaxWorkerCapacity ||
+		input.ActiveCount < 0 || input.ActiveCount > input.Capacity {
+		return protocol.Worker{}, invalid("invalid_capacity", fmt.Sprintf(
+			"capacity must be %d through %d and active_count cannot exceed it",
+			protocol.MinWorkerCapacity, protocol.MaxWorkerCapacity))
 	}
 	if input.Health != "healthy" && input.Health != "unhealthy" {
 		return protocol.Worker{}, invalid("invalid_health", "health must be healthy or unhealthy")
+	}
+	capabilities, err := normalizeWorkerCapabilities(input)
+	if err != nil {
+		return protocol.Worker{}, err
+	}
+	input.Capabilities = capabilities
+	if input.WeeklyLimit != nil {
+		if input.WeeklyLimit.UsedPercent < 0 || input.WeeklyLimit.UsedPercent > 100 ||
+			input.WeeklyLimit.ResetsAt.IsZero() {
+			return protocol.Worker{}, invalid(
+				"invalid_weekly_limit", "weekly_limit must contain a percentage from 0 through 100 and a reset time")
+		}
+		input.WeeklyLimit.ResetsAt = input.WeeklyLimit.ResetsAt.UTC()
 	}
 	if input.CapacityHandoffVersion < 0 || input.CapacityHandoffVersion > 1 {
 		return protocol.Worker{}, invalid(
@@ -809,6 +1433,21 @@ func (s *Store) RegisterWorker(ctx context.Context, workerID string, input proto
 			"cached managed repository IDs could not be encoded",
 		)
 	}
+	capabilitiesJSON, err := json.Marshal(input.Capabilities)
+	if err != nil || len(capabilitiesJSON) > protocol.MaxBodyBytes {
+		return protocol.Worker{}, invalid(
+			"invalid_capabilities", "worker capabilities could not be encoded",
+		)
+	}
+	labelsJSON, err := json.Marshal(input.Labels)
+	if err != nil {
+		return protocol.Worker{}, invalid("invalid_labels", "Worker labels could not be encoded")
+	}
+	var weeklyLimitUsedPercent, weeklyLimitResetsAt any
+	if input.WeeklyLimit != nil {
+		weeklyLimitUsedPercent = input.WeeklyLimit.UsedPercent
+		weeklyLimitResetsAt = input.WeeklyLimit.ResetsAt.UnixMilli()
+	}
 	now := s.now().UnixMilli()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -848,21 +1487,32 @@ func (s *Store) RegisterWorker(ctx context.Context, workerID string, input proto
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO workers(
-			id, name, worker_version, runtime, runtime_version, capacity, active_count,
-			health, source_access_json, accepts_managed_repositories,
-			managed_repository_ids_json, retained_worktrees_json, registered_at, last_heartbeat
+			id, name, labels_json, worker_version, work_claim_protocol_version,
+			runtime, runtime_version, capacity, active_count,
+			health, capabilities_json, source_access_json, accepts_managed_repositories,
+			managed_repository_ids_json, retained_worktrees_json,
+			weekly_limit_used_percent, weekly_limit_resets_at, registered_at, last_heartbeat
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
-			name=excluded.name, worker_version=excluded.worker_version, runtime_version=excluded.runtime_version,
+			name=excluded.name, labels_json=excluded.labels_json,
+			worker_version=excluded.worker_version,
+			work_claim_protocol_version=excluded.work_claim_protocol_version,
+			runtime_version=excluded.runtime_version,
 			capacity=excluded.capacity, active_count=excluded.active_count, health=excluded.health,
+			capabilities_json=excluded.capabilities_json,
 			source_access_json=excluded.source_access_json,
 			accepts_managed_repositories=excluded.accepts_managed_repositories,
 			managed_repository_ids_json=excluded.managed_repository_ids_json,
-			retained_worktrees_json=excluded.retained_worktrees_json, last_heartbeat=excluded.last_heartbeat
-	`, workerID, input.Name, input.WorkerVersion, input.Runtime, input.RuntimeVersion,
-		input.Capacity, input.ActiveCount, input.Health, sourceAccessJSON,
-		input.AcceptsManagedRepositories, managedRepositoryIDsJSON, retained, now, now)
+			retained_worktrees_json=excluded.retained_worktrees_json,
+			weekly_limit_used_percent=excluded.weekly_limit_used_percent,
+			weekly_limit_resets_at=excluded.weekly_limit_resets_at,
+			last_heartbeat=excluded.last_heartbeat
+	`, workerID, input.Name, labelsJSON, input.WorkerVersion, input.WorkClaimProtocolVersion,
+		input.Runtime, input.RuntimeVersion,
+		input.Capacity, input.ActiveCount, input.Health, capabilitiesJSON, sourceAccessJSON,
+		input.AcceptsManagedRepositories, managedRepositoryIDsJSON, retained,
+		weeklyLimitUsedPercent, weeklyLimitResetsAt, now, now)
 	if err != nil {
 		return protocol.Worker{}, unavailable(err)
 	}
@@ -991,9 +1641,9 @@ func (s *Store) RegisterWorker(ctx context.Context, workerID string, input proto
 			  AND NOT EXISTS (
 			      SELECT 1
 			      FROM executions execution
-			      JOIN tasks task ON task.id = execution.task_id
+			      JOIN work_targets target ON target.id = execution.work_target_id
 			      WHERE execution.assigned_worker_id = ?
-			        AND task.repository_id = ?
+			        AND target.repository_id = ?
 			        AND execution.state IN ('queued', 'preparing', 'running')
 			  )
 		`, now, workerID, repositoryID, workerID, repositoryID)
@@ -1049,8 +1699,8 @@ func (s *Store) RegisterWorker(ctx context.Context, workerID string, input proto
 			  AND execution_id IN (
 			      SELECT e.id
 			      FROM executions e
-			      JOIN tasks t ON t.id = e.task_id
-			      WHERE t.repository_id = ?
+			      JOIN work_targets target ON target.id = e.work_target_id
+			      WHERE target.repository_id = ?
 			  )
 		`, workerID, input.ActiveCount, canBulkAcknowledge, repositoryID); err != nil {
 			return protocol.Worker{}, unavailable(err)
@@ -1065,8 +1715,8 @@ func (s *Store) RegisterWorker(ctx context.Context, workerID string, input proto
 				  AND execution_id IN (
 				      SELECT e.id
 				      FROM executions e
-				      JOIN tasks t ON t.id = e.task_id
-				      WHERE t.repository_id = ?
+				      JOIN work_targets target ON target.id = e.work_target_id
+				      WHERE target.repository_id = ?
 				  )
 			`, attemptID, workerID, repositoryID); err != nil {
 				return protocol.Worker{}, unavailable(err)
@@ -1079,16 +1729,93 @@ func (s *Store) RegisterWorker(ctx context.Context, workerID string, input proto
 	return s.Worker(ctx, workerID)
 }
 
+func normalizeWorkerLabels(input map[string]string) (map[string]string, error) {
+	if len(input) > 20 {
+		return nil, invalid("invalid_labels", "a Worker may advertise at most 20 labels")
+	}
+	labels := make(map[string]string, len(input))
+	for key, value := range input {
+		trimmedKey := strings.TrimSpace(key)
+		trimmedValue := strings.TrimSpace(value)
+		if trimmedKey == "" || trimmedKey != key || len(trimmedKey) > 100 || len(trimmedValue) > 200 {
+			return nil, invalid("invalid_labels", "Worker label keys must be trimmed and at most 100 bytes; values must be at most 200 bytes")
+		}
+		labels[trimmedKey] = trimmedValue
+	}
+	return labels, nil
+}
+
+func normalizeWorkerCapabilities(input protocol.WorkerRegistration) ([]protocol.Capability, error) {
+	capabilities := append([]protocol.Capability(nil), input.Capabilities...)
+	if len(capabilities) == 0 {
+		status := protocol.CapabilityUnhealthy
+		if input.Health == "healthy" {
+			status = protocol.CapabilityReady
+		}
+		return []protocol.Capability{{
+			Kind: protocol.CapabilityKindRuntime, Name: input.Runtime,
+			Status: status, Version: input.RuntimeVersion,
+		}}, nil
+	}
+	if len(capabilities) > 20 {
+		return nil, invalid("invalid_capabilities", "a worker may advertise at most 20 capabilities")
+	}
+	seen := make(map[string]bool, len(capabilities))
+	primaryFound := false
+	for index := range capabilities {
+		capability := &capabilities[index]
+		capability.Kind = strings.ToLower(strings.TrimSpace(capability.Kind))
+		capability.Name = strings.ToLower(strings.TrimSpace(capability.Name))
+		capability.Status = strings.ToLower(strings.TrimSpace(capability.Status))
+		capability.Version = strings.TrimSpace(capability.Version)
+		capability.Message = strings.TrimSpace(capability.Message)
+		if capability.Kind != protocol.CapabilityKindTool && capability.Kind != protocol.CapabilityKindRuntime {
+			return nil, invalid("invalid_capabilities", "capability kind must be tool or runtime")
+		}
+		if capability.Kind == protocol.CapabilityKindRuntime && !protocol.SupportedRuntime(capability.Name) {
+			return nil, invalid("invalid_capabilities", "runtime capabilities must be pi, codex, or claude-code")
+		}
+		if capability.Kind == protocol.CapabilityKindTool && capability.Name != "git" && capability.Name != "gh" {
+			return nil, invalid("invalid_capabilities", "tool capabilities must be git or gh")
+		}
+		switch capability.Status {
+		case protocol.CapabilityReady, protocol.CapabilityMissing,
+			protocol.CapabilityUnauthenticated, protocol.CapabilityUnhealthy:
+		default:
+			return nil, invalid(
+				"invalid_capabilities",
+				"capability status must be ready, missing, unauthenticated, or unhealthy",
+			)
+		}
+		if len(capability.Version) > 1024 || len(capability.Message) > 1024 {
+			return nil, invalid("invalid_capabilities", "capability version and message must be at most 1024 bytes")
+		}
+		key := capability.Kind + ":" + capability.Name
+		if seen[key] {
+			return nil, invalid("invalid_capabilities", "capabilities must be unique by kind and name")
+		}
+		seen[key] = true
+		primaryFound = primaryFound ||
+			(capability.Kind == protocol.CapabilityKindRuntime && capability.Name == input.Runtime)
+	}
+	if !primaryFound {
+		return nil, invalid("invalid_capabilities", "capabilities must include the worker primary runtime")
+	}
+	return capabilities, nil
+}
+
 func (s *Store) Workers(ctx context.Context) ([]protocol.Worker, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT w.id, w.name, w.worker_version, w.runtime, w.runtime_version,
-		       w.capacity, w.active_count, w.health, w.source_access_json,
+		SELECT w.id, w.name, w.labels_json, w.worker_version, w.runtime, w.runtime_version,
+		       w.capacity, w.active_count, w.health, w.capabilities_json, w.source_access_json,
 		       w.accepts_managed_repositories, w.managed_repository_ids_json,
 		       w.retained_worktrees_json,
 		       w.registered_at, w.last_heartbeat,
 		       COALESCE((
-		           SELECT t.title
-		           FROM executions e JOIN tasks t ON t.id = e.task_id
+		           SELECT json_extract(work.routine_snapshot, '$.name')
+		           FROM executions e
+		           JOIN work_targets target ON target.id = e.work_target_id
+		           JOIN work ON work.id = target.work_id
 		           WHERE e.assigned_worker_id = w.id AND e.state IN ('preparing', 'running')
 		           ORDER BY e.updated_at DESC, e.id DESC
 		           LIMIT 1
@@ -1125,14 +1852,16 @@ func (s *Store) Workers(ctx context.Context) ([]protocol.Worker, error) {
 
 func (s *Store) Worker(ctx context.Context, id string) (protocol.Worker, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT w.id, w.name, w.worker_version, w.runtime, w.runtime_version,
-		       w.capacity, w.active_count, w.health, w.source_access_json,
+		SELECT w.id, w.name, w.labels_json, w.worker_version, w.runtime, w.runtime_version,
+		       w.capacity, w.active_count, w.health, w.capabilities_json, w.source_access_json,
 		       w.accepts_managed_repositories, w.managed_repository_ids_json,
 		       w.retained_worktrees_json,
 		       w.registered_at, w.last_heartbeat,
 		       COALESCE((
-		           SELECT t.title
-		           FROM executions e JOIN tasks t ON t.id = e.task_id
+		           SELECT json_extract(work.routine_snapshot, '$.name')
+		           FROM executions e
+		           JOIN work_targets target ON target.id = e.work_target_id
+		           JOIN work ON work.id = target.work_id
 		           WHERE e.assigned_worker_id = w.id AND e.state IN ('preparing', 'running')
 		           ORDER BY e.updated_at DESC, e.id DESC
 		           LIMIT 1
@@ -1156,14 +1885,20 @@ type scanner interface {
 
 func scanWorker(row scanner, now time.Time) (protocol.Worker, error) {
 	var worker protocol.Worker
-	var sourceAccess, managedRepositoryIDs, retained []byte
+	var labels, capabilities, sourceAccess, managedRepositoryIDs, retained []byte
 	var acceptsManagedRepositories int
 	var registered, heartbeat int64
-	if err := row.Scan(&worker.ID, &worker.Name, &worker.WorkerVersion, &worker.Runtime, &worker.RuntimeVersion,
-		&worker.Capacity, &worker.ActiveCount, &worker.Health, &sourceAccess,
+	if err := row.Scan(&worker.ID, &worker.Name, &labels, &worker.WorkerVersion, &worker.Runtime, &worker.RuntimeVersion,
+		&worker.Capacity, &worker.ActiveCount, &worker.Health, &capabilities, &sourceAccess,
 		&acceptsManagedRepositories, &managedRepositoryIDs,
 		&retained, &registered, &heartbeat,
-		&worker.CurrentTaskTitle); err != nil {
+		&worker.CurrentWorkTitle); err != nil {
+		return worker, err
+	}
+	if err := json.Unmarshal(labels, &worker.Labels); err != nil {
+		return worker, err
+	}
+	if err := json.Unmarshal(capabilities, &worker.Capabilities); err != nil {
 		return worker, err
 	}
 	if err := json.Unmarshal(sourceAccess, &worker.SourceAccess); err != nil {
@@ -1207,7 +1942,12 @@ func (s *Store) workerRepositories(ctx context.Context, workerID string) ([]prot
 	return repos, rows.Err()
 }
 
-type taskRouteCandidate struct {
+type workRoute struct {
+	repositoryRemoteIdentity string
+	sourceAccess             protocol.SourceAccess
+}
+
+type workRouteCandidate struct {
 	workerID                   string
 	repositoryID               string
 	runtime                    string
@@ -1217,28 +1957,53 @@ type taskRouteCandidate struct {
 	acceptsManagedRepositories bool
 }
 
-func normalizeTaskRoute(route *protocol.TaskRoute) error {
-	route.RepositoryRemoteIdentity = normalizeRemote(route.RepositoryRemoteIdentity)
-	values, err := normalizeSourceAccess([]protocol.SourceAccess{route.SourceAccess})
+func runtimeCapabilityReady(capabilities []protocol.Capability, runtime string) bool {
+	for _, capability := range capabilities {
+		if capability.Kind == protocol.CapabilityKindRuntime && capability.Name == runtime &&
+			capability.Status == protocol.CapabilityReady {
+			return true
+		}
+	}
+	return false
+}
+
+func preferredReadyRuntime(primary string, capabilities []protocol.Capability) string {
+	if len(capabilities) == 0 {
+		return primary
+	}
+	if runtimeCapabilityReady(capabilities, primary) {
+		return primary
+	}
+	for _, capability := range capabilities {
+		if capability.Kind == protocol.CapabilityKindRuntime && capability.Status == protocol.CapabilityReady {
+			return capability.Name
+		}
+	}
+	return ""
+}
+
+func normalizeWorkRoute(route *workRoute) error {
+	route.repositoryRemoteIdentity = normalizeRemote(route.repositoryRemoteIdentity)
+	values, err := normalizeSourceAccess([]protocol.SourceAccess{route.sourceAccess})
 	if err != nil {
 		return err
 	}
-	if route.RepositoryRemoteIdentity == "" || len(route.RepositoryRemoteIdentity) > 2048 {
+	if route.repositoryRemoteIdentity == "" || len(route.repositoryRemoteIdentity) > 2048 {
 		return invalid(
 			"invalid_route",
 			"route repository_remote_identity is required and must be at most 2048 bytes",
 		)
 	}
-	route.SourceAccess = values[0]
-	if route.SourceAccess.Provider == "github" && route.SourceAccess.Hostname == "github.com" {
-		canonical, err := normalizeManagedGitHubRemote(route.RepositoryRemoteIdentity)
+	route.sourceAccess = values[0]
+	if route.sourceAccess.Provider == "github" && route.sourceAccess.Hostname == "github.com" {
+		canonical, err := normalizeManagedGitHubRemote(route.repositoryRemoteIdentity)
 		if err != nil {
 			return invalid(
 				"invalid_route",
 				"GitHub route repository_remote_identity must use github.com/owner/repository",
 			)
 		}
-		route.RepositoryRemoteIdentity = canonical
+		route.repositoryRemoteIdentity = canonical
 	}
 	return nil
 }
@@ -1252,39 +2017,67 @@ func hasSourceAccess(values []protocol.SourceAccess, required protocol.SourceAcc
 	return false
 }
 
-func betterRoute(candidate, current taskRouteCandidate) bool {
+func betterRoute(candidate, current workRouteCandidate) bool {
 	left := candidate.load * current.capacity
 	right := current.load * candidate.capacity
 	return left < right || (left == right && candidate.workerID < current.workerID)
 }
 
-func (s *Store) selectTaskRoute(
+func (s *Store) selectWorkRoute(
 	ctx context.Context,
 	tx *sql.Tx,
-	route protocol.TaskRoute,
+	route workRoute,
+	selectedRepositoryID string,
 	now int64,
-) (taskRouteCandidate, error) {
+	requireSourceAccess bool,
+	allowStaticRepository bool,
+	workerID string,
+	requiredRuntime string,
+) (workRouteCandidate, error) {
 	repositoryPredicate := "r.remote_identity = ?"
-	if route.SourceAccess.Provider == "github" && route.SourceAccess.Hostname == "github.com" {
+	repositoryLookup := route.repositoryRemoteIdentity
+	if selectedRepositoryID != "" {
+		repositoryPredicate = "r.id = ?"
+		repositoryLookup = selectedRepositoryID
+	} else if route.sourceAccess.Provider == "github" && route.sourceAccess.Hostname == "github.com" {
 		repositoryPredicate = "lower(r.remote_identity) = lower(?)"
 	}
 	var repositoryID, repositoryIdentity string
+	var repositoryEnabled int
 	err := tx.QueryRowContext(ctx, `
-		SELECT r.id, r.remote_identity
+		SELECT r.id, r.remote_identity, r.enabled
 		FROM repositories r
-		WHERE `+repositoryPredicate+` AND r.enabled = 1
-	`, route.RepositoryRemoteIdentity).Scan(&repositoryID, &repositoryIdentity)
+		WHERE `+repositoryPredicate+`
+		  AND (
+		      r.enabled = 1
+		      OR (? = 1 AND EXISTS (
+		          SELECT 1 FROM worker_repositories available
+		          WHERE available.repository_id = r.id
+		            AND available.advertised = 1
+		            AND available.dynamic = 0
+		      ))
+			  )
+	`, repositoryLookup, allowStaticRepository).Scan(&repositoryID, &repositoryIdentity, &repositoryEnabled)
 	if errors.Is(err, sql.ErrNoRows) {
-		return taskRouteCandidate{}, conflict(
+		return workRouteCandidate{}, conflict(
 			"repository_not_managed",
 			"repository is not enabled in the control-plane managed repository catalog",
 		)
 	}
 	if err != nil {
-		return taskRouteCandidate{}, unavailable(err)
+		return workRouteCandidate{}, unavailable(err)
 	}
+	workerRepositoryIdentity := route.repositoryRemoteIdentity
+	if workerRepositoryIdentity == "" {
+		workerRepositoryIdentity = repositoryIdentity
+	}
+	if canonical, normalizeErr := normalizeManagedGitHubRemote(workerRepositoryIdentity); normalizeErr == nil {
+		workerRepositoryIdentity = canonical
+	}
+	requireAdvertisedRepository := allowStaticRepository &&
+		(repositoryEnabled == 0 || route.sourceAccess.Provider != "github" || route.sourceAccess.Hostname != "github.com")
 	rows, err := tx.QueryContext(ctx, `
-		SELECT w.id, w.runtime, w.capacity, w.active_count,
+		SELECT w.id, w.runtime, w.capabilities_json, w.capacity, w.active_count,
 		       w.source_access_json, COALESCE(wr.advertised, 0),
 		       w.accepts_managed_repositories,
 		       COALESCE((
@@ -1295,7 +2088,10 @@ func (s *Store) selectTaskRoute(
 		LEFT JOIN worker_repositories wr
 		  ON wr.worker_id = w.id AND wr.repository_id = ?
 		WHERE w.health = 'healthy'
+		  AND w.work_claim_protocol_version = ?
 		  AND w.last_heartbeat >= ?
+		  AND (? = '' OR w.id = ?)
+		  AND (? = 0 OR COALESCE(wr.advertised, 0) = 1)
 		  AND (
 		      COALESCE(wr.advertised, 0) = 1
 		      OR NOT EXISTS (
@@ -1335,49 +2131,65 @@ func (s *Store) selectTaskRoute(
 		      SELECT COUNT(*)
 		      FROM attempts active_attempt
 		      JOIN executions active_execution ON active_execution.id = active_attempt.execution_id
-		      JOIN tasks active_task ON active_task.id = active_execution.task_id
+		      JOIN work_targets active_target ON active_target.id = active_execution.work_target_id
 		      WHERE active_attempt.worker_id = w.id
-		        AND active_task.repository_id = ?
+		        AND active_target.repository_id = ?
 		        AND active_attempt.state IN ('preparing', 'running')
 		  ) + (
 		      SELECT COUNT(*)
 		      FROM attempts terminal_attempt
 		      JOIN executions terminal_execution ON terminal_execution.id = terminal_attempt.execution_id
-		      JOIN tasks terminal_task ON terminal_task.id = terminal_execution.task_id
+		      JOIN work_targets terminal_target ON terminal_target.id = terminal_execution.work_target_id
 		      WHERE terminal_attempt.worker_id = w.id
-		        AND terminal_task.repository_id = ?
+		        AND terminal_target.repository_id = ?
 		        AND terminal_attempt.state IN ('succeeded', 'failed', 'cancelled', 'lost')
 		        AND terminal_attempt.capacity_acknowledged = 0
 		  ) < ?
 		ORDER BY w.id
-	`, repositoryID, now-protocol.WorkerOnlineWindow.Milliseconds(), repositoryIdentity, repositoryID,
+	`, repositoryID, protocol.WorkClaimProtocolVersion,
+		now-protocol.WorkerOnlineWindow.Milliseconds(), workerID, workerID,
+		requireAdvertisedRepository,
+		workerRepositoryIdentity, repositoryID,
 		repositoryID, protocol.MaxRepositoryCacheEntries,
 		repositoryID, repositoryID, protocol.MaxRetainedPerRepo)
 	if err != nil {
-		return taskRouteCandidate{}, unavailable(err)
+		return workRouteCandidate{}, unavailable(err)
 	}
 	defer rows.Close()
-	var best taskRouteCandidate
+	var best workRouteCandidate
 	found := false
 	for rows.Next() {
-		var candidate taskRouteCandidate
+		var candidate workRouteCandidate
 		var active, queued, repositoryAdvertised, acceptsManagedRepositories int
-		var encoded []byte
+		var primaryRuntime string
+		var encoded, encodedCapabilities []byte
 		if err := rows.Scan(
-			&candidate.workerID, &candidate.runtime, &candidate.capacity,
+			&candidate.workerID, &primaryRuntime, &encodedCapabilities, &candidate.capacity,
 			&active, &encoded, &repositoryAdvertised, &acceptsManagedRepositories, &queued,
 		); err != nil {
 			rows.Close()
-			return taskRouteCandidate{}, unavailable(err)
+			return workRouteCandidate{}, unavailable(err)
 		}
 		candidate.repositoryID = repositoryID
 		candidate.repositoryAdvertised = repositoryAdvertised != 0
 		candidate.acceptsManagedRepositories = acceptsManagedRepositories != 0
 		var access []protocol.SourceAccess
 		if err := json.Unmarshal(encoded, &access); err != nil {
-			return taskRouteCandidate{}, unavailable(err)
+			return workRouteCandidate{}, unavailable(err)
 		}
-		if !hasSourceAccess(access, route.SourceAccess) {
+		var capabilities []protocol.Capability
+		if err := json.Unmarshal(encodedCapabilities, &capabilities); err != nil {
+			return workRouteCandidate{}, unavailable(err)
+		}
+		candidate.runtime = requiredRuntime
+		if candidate.runtime == "" {
+			candidate.runtime = preferredReadyRuntime(primaryRuntime, capabilities)
+		}
+		if len(capabilities) != 0 && !runtimeCapabilityReady(capabilities, candidate.runtime) {
+			continue
+		}
+		if requireSourceAccess && !(allowStaticRepository && candidate.repositoryAdvertised) &&
+			!hasSourceAccess(access, route.sourceAccess) {
 			continue
 		}
 		candidate.load = active + queued
@@ -1388,20 +2200,24 @@ func (s *Store) selectTaskRoute(
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return taskRouteCandidate{}, unavailable(err)
+		return workRouteCandidate{}, unavailable(err)
 	}
 	if err := rows.Close(); err != nil {
-		return taskRouteCandidate{}, unavailable(err)
+		return workRouteCandidate{}, unavailable(err)
 	}
 	if !found {
-		return taskRouteCandidate{}, conflict(
+		message := "no healthy online worker can acquire the repository and access its source provider"
+		if !requireSourceAccess {
+			message = "no healthy online worker can acquire the repository"
+		}
+		return workRouteCandidate{}, conflict(
 			"no_eligible_worker",
-			"no healthy online worker can acquire the repository and access its source provider",
+			message,
 		)
 	}
 	if !best.repositoryAdvertised {
 		if !best.acceptsManagedRepositories {
-			return taskRouteCandidate{}, unavailable(errors.New("selected worker cannot acquire managed repositories"))
+			return workRouteCandidate{}, unavailable(errors.New("selected worker cannot acquire managed repositories"))
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO worker_repositories(
@@ -1415,353 +2231,68 @@ func (s *Store) selectTaskRoute(
 				advertised=1,
 				dynamic=1,
 				updated_at=excluded.updated_at
-		`, best.workerID, repositoryIdentity, repositoryID, repositoryIdentity, now); err != nil {
-			return taskRouteCandidate{}, unavailable(err)
+		`, best.workerID, workerRepositoryIdentity, repositoryID, workerRepositoryIdentity, now); err != nil {
+			return workRouteCandidate{}, unavailable(err)
 		}
 	}
 	return best, nil
 }
 
-func (s *Store) CreateTask(ctx context.Context, input protocol.CreateTaskRequest) (protocol.TaskDetail, bool, error) {
-	input.RequestKey = strings.TrimSpace(input.RequestKey)
-	input.Title = strings.TrimSpace(input.Title)
-	input.WorkerID = strings.TrimSpace(input.WorkerID)
-	input.RepositoryID = strings.TrimSpace(input.RepositoryID)
-	if input.RequestKey == "" || len(input.RequestKey) > 200 {
-		return protocol.TaskDetail{}, false, invalid("invalid_request_key", "request_key is required")
-	}
-	if input.Title == "" || utf8.RuneCountInString(input.Title) > 200 {
-		return protocol.TaskDetail{}, false, invalid("invalid_title", "title is required and limited to 200 Unicode characters")
-	}
-	if strings.TrimSpace(input.Description) == "" || len([]byte(input.Description)) > protocol.MaxDescriptionBytes {
-		return protocol.TaskDetail{}, false, invalid("invalid_description", "description is required and limited to 64 KiB")
-	}
-	if input.TimeoutSeconds == 0 {
-		input.TimeoutSeconds = int(protocol.DefaultTimeout.Seconds())
-	}
-	if input.TimeoutSeconds < 1 || input.TimeoutSeconds > int(protocol.MaxTimeout/time.Second) {
-		return protocol.TaskDetail{}, false, invalid("invalid_timeout", "timeout_seconds must be between 1 and 28800")
-	}
-	if input.Route == nil {
-		if input.WorkerID == "" || input.RepositoryID == "" {
-			return protocol.TaskDetail{}, false, invalid(
-				"invalid_assignment",
-				"worker_id and repository_id are required when route is omitted",
-			)
-		}
-	} else {
-		if input.WorkerID != "" || input.RepositoryID != "" {
-			return protocol.TaskDetail{}, false, invalid(
-				"invalid_assignment",
-				"route cannot be combined with worker_id or repository_id",
-			)
-		}
-		if err := normalizeTaskRoute(input.Route); err != nil {
-			return protocol.TaskDetail{}, false, err
-		}
-	}
-	now := s.now().UnixMilli()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return protocol.TaskDetail{}, false, unavailable(err)
-	}
-	defer tx.Rollback()
-	var existingID string
-	err = tx.QueryRowContext(ctx, `SELECT id FROM tasks WHERE request_key = ?`, input.RequestKey).Scan(&existingID)
-	if err == nil {
-		if err := tx.Commit(); err != nil {
-			return protocol.TaskDetail{}, false, unavailable(err)
-		}
-		detail, err := s.Task(ctx, existingID)
-		return detail, false, err
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return protocol.TaskDetail{}, false, unavailable(err)
-	}
-	var runtime string
-	if input.Route != nil {
-		selection, routeErr := s.selectTaskRoute(ctx, tx, *input.Route, now)
-		if routeErr != nil {
-			return protocol.TaskDetail{}, false, routeErr
-		}
-		input.WorkerID = selection.workerID
-		input.RepositoryID = selection.repositoryID
-		runtime = selection.runtime
-	} else {
-		err = tx.QueryRowContext(ctx, `
-			SELECT w.runtime
-			FROM workers w
-			JOIN worker_repositories wr ON wr.worker_id = w.id
-			WHERE w.id = ? AND wr.repository_id = ? AND wr.advertised = 1
-		`, input.WorkerID, input.RepositoryID).Scan(&runtime)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return protocol.TaskDetail{}, false, unavailable(err)
-		}
-		if errors.Is(err, sql.ErrNoRows) {
-			return protocol.TaskDetail{}, false, invalid("repository_not_advertised", "repository is not advertised by the assigned worker")
-		}
-	}
-	taskID, err := newID()
-	if err != nil {
-		return protocol.TaskDetail{}, false, unavailable(err)
-	}
-	executionID, err := newID()
-	if err != nil {
-		return protocol.TaskDetail{}, false, unavailable(err)
-	}
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO tasks(id, request_key, title, description, repository_id, timeout_seconds, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, taskID, input.RequestKey, input.Title, input.Description, input.RepositoryID, input.TimeoutSeconds, now)
-	if err == nil {
-		_, err = tx.ExecContext(ctx, `
-			INSERT INTO executions(id, task_id, assigned_worker_id, required_runtime, state, created_at, updated_at)
-			VALUES (?, ?, ?, ?, 'queued', ?, ?)
-		`, executionID, taskID, input.WorkerID, runtime, now, now)
-	}
-	if err != nil {
-		return protocol.TaskDetail{}, false, unavailable(err)
-	}
-	if err := tx.Commit(); err != nil {
-		return protocol.TaskDetail{}, false, unavailable(err)
-	}
-	detail, err := s.Task(ctx, taskID)
-	return detail, true, err
-}
-
-func (s *Store) Tasks(ctx context.Context, request protocol.TaskPageRequest) (protocol.TaskPage, error) {
-	if request.Limit < 1 || request.Limit > protocol.MaxTaskPageSize {
-		return protocol.TaskPage{}, invalid("invalid_limit", "limit must be between 1 and 200")
-	}
-	query := `
-		SELECT t.id, t.request_key, t.title, t.repository_id, t.timeout_seconds,
-		       e.assigned_worker_id, e.state, t.created_at
-		FROM tasks t JOIN executions e ON e.task_id = t.id
-	`
-	args := make([]any, 0, 3)
-	if request.Cursor != nil {
-		query += ` WHERE (t.created_at < ? OR (t.created_at = ? AND t.id < ?))`
-		args = append(args, request.Cursor.CreatedAtMillis, request.Cursor.CreatedAtMillis, request.Cursor.ID)
-	}
-	query += ` ORDER BY t.created_at DESC, t.id DESC LIMIT ?`
-	args = append(args, request.Limit+1)
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return protocol.TaskPage{}, unavailable(err)
-	}
-	defer rows.Close()
-	tasks := make([]protocol.Task, 0, request.Limit+1)
-	for rows.Next() {
-		task, err := scanTask(rows, false)
-		if err != nil {
-			return protocol.TaskPage{}, unavailable(err)
-		}
-		tasks = append(tasks, task)
-	}
-	if err := rows.Err(); err != nil {
-		return protocol.TaskPage{}, unavailable(err)
-	}
-	page := protocol.TaskPage{Tasks: tasks}
-	if len(tasks) > request.Limit {
-		page.Tasks = tasks[:request.Limit]
-		last := page.Tasks[len(page.Tasks)-1]
-		page.NextCursor = &protocol.TaskCursor{
-			CreatedAtMillis: last.CreatedAt.UnixMilli(),
-			ID:              last.ID,
-		}
-	}
-	return page, nil
-}
-
-func scanTask(row scanner, detail bool) (protocol.Task, error) {
-	var task protocol.Task
-	var created int64
-	var err error
-	if detail {
-		err = row.Scan(&task.ID, &task.RequestKey, &task.Title, &task.Description, &task.RepositoryID,
-			&task.TimeoutSeconds, &task.WorkerID, &task.State, &created)
-	} else {
-		err = row.Scan(&task.ID, &task.RequestKey, &task.Title, &task.RepositoryID,
-			&task.TimeoutSeconds, &task.WorkerID, &task.State, &created)
-	}
-	task.CreatedAt = fromMillis(created)
-	if task.State == "preparing" {
-		task.State = "running"
-	}
-	return task, err
-}
-
-func (s *Store) Task(ctx context.Context, id string) (protocol.TaskDetail, error) {
-	var detail protocol.TaskDetail
-	row := s.db.QueryRowContext(ctx, `
-		SELECT t.id, t.request_key, t.title, t.description, t.repository_id, t.timeout_seconds,
-		       e.assigned_worker_id, e.state, t.created_at
-		FROM tasks t JOIN executions e ON e.task_id = t.id WHERE t.id = ?
-	`, id)
-	task, err := scanTask(row, true)
+func (s *Store) selectWorkTargetRoute(
+	ctx context.Context,
+	tx *sql.Tx,
+	repositoryID string,
+	repositoryIdentity string,
+	now int64,
+	workerID string,
+	requiredRuntime string,
+) (workRouteCandidate, error) {
+	var currentIdentity string
+	var enabled, centrallyManaged int
+	err := tx.QueryRowContext(ctx, `
+		SELECT remote_identity, enabled, centrally_managed FROM repositories WHERE id = ?
+	`, repositoryID).Scan(&currentIdentity, &enabled, &centrallyManaged)
 	if errors.Is(err, sql.ErrNoRows) {
-		return detail, ErrNotFound
+		return workRouteCandidate{}, conflict("repository_not_available", "repository is not configured on a Worker or enabled for managed acquisition")
 	}
 	if err != nil {
-		return detail, unavailable(err)
+		return workRouteCandidate{}, unavailable(err)
 	}
-	detail.Task = task
-	row = s.db.QueryRowContext(ctx, `
-		SELECT id, task_id, assigned_worker_id, required_runtime, state,
-		       cancellation_requested, created_at, updated_at
-		FROM executions WHERE task_id = ?
-	`, id)
-	detail.Execution, err = scanExecution(row)
-	if err != nil {
-		return detail, unavailable(err)
+	if repositoryIdentity == "" {
+		repositoryIdentity = currentIdentity
 	}
-	var advertised int
-	err = s.db.QueryRowContext(ctx, `
-		SELECT r.id, wr.display_key, r.remote_identity, wr.retained_count, wr.advertised
-		FROM repositories r JOIN worker_repositories wr ON wr.repository_id = r.id
-		WHERE r.id = ? AND wr.worker_id = ?
-	`, detail.Task.RepositoryID, detail.Execution.AssignedWorkerID).Scan(
-		&detail.Repository.ID, &detail.Repository.Key, &detail.Repository.RemoteIdentity,
-		&detail.Repository.RetainedCount, &advertised)
-	if err != nil {
-		return detail, unavailable(err)
+	route := workRoute{
+		repositoryRemoteIdentity: repositoryIdentity,
+		sourceAccess:             protocol.SourceAccess{Provider: "local", Hostname: "localhost"},
 	}
-	detail.RepositoryAvailable = advertised != 0
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, execution_id, worker_id, attempt_number, state, lease_expires_at,
-		       supervisor_pid, process_identity, process_group_id, result, error,
-		       started_at, completed_at, created_at
-		FROM attempts WHERE execution_id = ? ORDER BY attempt_number
-	`, detail.Execution.ID)
-	if err != nil {
-		return detail, unavailable(err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		attempt, err := scanAttempt(rows)
-		if err != nil {
-			return detail, unavailable(err)
-		}
-		detail.Attempts = append(detail.Attempts, attempt)
-	}
-	return detail, rows.Err()
-}
-
-func (s *Store) DeleteTask(ctx context.Context, taskID string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return unavailable(err)
-	}
-	defer tx.Rollback()
-
-	var executionID, state string
-	err = tx.QueryRowContext(ctx, `
-		SELECT id, state FROM executions WHERE task_id = ?
-	`, taskID).Scan(&executionID, &state)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrNotFound
-	}
-	if err != nil {
-		return unavailable(err)
-	}
-	if state != "succeeded" && state != "failed" && state != "cancelled" {
-		return conflict("task_not_terminal", "only terminal task history can be deleted")
-	}
-
-	var pendingDisposition int
-	if err := tx.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM attempts
-		WHERE execution_id = ? AND capacity_acknowledged = 0
-	`, executionID).Scan(&pendingDisposition); err != nil {
-		return unavailable(err)
-	}
-	if pendingDisposition != 0 {
-		return conflict(
-			"worktree_disposition_pending",
-			"wait for the worker to report whether terminal attempt worktrees were retained or cleaned",
+	if centrallyManaged != 0 && enabled == 0 {
+		return workRouteCandidate{}, conflict(
+			"repository_not_managed", "repository is not enabled in the control-plane managed repository catalog",
 		)
 	}
-
-	attemptRows, err := tx.QueryContext(ctx, `SELECT id FROM attempts WHERE execution_id = ?`, executionID)
-	if err != nil {
-		return unavailable(err)
+	requireSourceAccess := false
+	if _, githubErr := normalizeManagedGitHubRemote(repositoryIdentity); centrallyManaged != 0 && githubErr == nil {
+		route.sourceAccess = protocol.SourceAccess{Provider: "github", Hostname: "github.com"}
+		requireSourceAccess = true
 	}
-	attemptIDs := make(map[string]struct{})
-	for attemptRows.Next() {
-		var attemptID string
-		if err := attemptRows.Scan(&attemptID); err != nil {
-			attemptRows.Close()
-			return unavailable(err)
-		}
-		attemptIDs[attemptID] = struct{}{}
+	if err := normalizeWorkRoute(&route); err != nil {
+		return workRouteCandidate{}, err
 	}
-	if err := attemptRows.Close(); err != nil {
-		return unavailable(err)
-	}
-
-	workerRows, err := tx.QueryContext(ctx, `SELECT retained_worktrees_json FROM workers`)
-	if err != nil {
-		return unavailable(err)
-	}
-	for workerRows.Next() {
-		var encoded string
-		if err := workerRows.Scan(&encoded); err != nil {
-			workerRows.Close()
-			return unavailable(err)
-		}
-		var retained []protocol.RetainedWorktree
-		if err := json.Unmarshal([]byte(encoded), &retained); err != nil {
-			workerRows.Close()
-			return unavailable(fmt.Errorf("decode retained worktree report: %w", err))
-		}
-		for _, worktree := range retained {
-			if _, exists := attemptIDs[worktree.AttemptID]; exists {
-				workerRows.Close()
-				return conflict("retained_worktree", "clean retained worktrees before deleting task history")
-			}
-		}
-	}
-	if err := workerRows.Close(); err != nil {
-		return unavailable(err)
-	}
-
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM attempt_events
-		WHERE attempt_id IN (SELECT id FROM attempts WHERE execution_id = ?)
-	`, executionID); err != nil {
-		return unavailable(err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM claim_requests
-		WHERE attempt_id IN (SELECT id FROM attempts WHERE execution_id = ?)
-	`, executionID); err != nil {
-		return unavailable(err)
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM attempts WHERE execution_id = ?`, executionID); err != nil {
-		return unavailable(err)
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM executions WHERE id = ?`, executionID); err != nil {
-		return unavailable(err)
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM tasks WHERE id = ?`, taskID); err != nil {
-		return unavailable(err)
-	}
-	if err := tx.Commit(); err != nil {
-		return unavailable(err)
-	}
-	return nil
+	return s.selectWorkRoute(
+		ctx, tx, route, repositoryID, now, requireSourceAccess, true, workerID, requiredRuntime,
+	)
 }
 
-func scanExecution(row scanner) (protocol.Execution, error) {
-	var value protocol.Execution
-	var cancel int
-	var created, updated int64
-	err := row.Scan(&value.ID, &value.TaskID, &value.AssignedWorkerID, &value.RequiredRuntime,
-		&value.State, &cancel, &created, &updated)
-	value.CancellationRequested = cancel != 0
-	value.CreatedAt, value.UpdatedAt = fromMillis(created), fromMillis(updated)
-	return value, err
+func serviceErrorCode(err error, code string) bool {
+	var serviceErr *ServiceError
+	return errors.As(err, &serviceErr) && serviceErr.Code == code
+}
+
+func nullableString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
 }
 
 func fromMillis(value int64) time.Time { return time.UnixMilli(value).UTC() }
