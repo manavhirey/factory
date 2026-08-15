@@ -41,6 +41,9 @@ available through the [documentation index](docs/README.md).
 
 ## Quick start
 
+For a guided first run—from configuring one Worker through inspecting your
+first completed Work—follow the [Starter Guide](docs/starter-guide.md).
+
 Requirements:
 
 - Go 1.25.13 or newer on the 1.25 release line, or Go 1.26.5 or newer
@@ -93,7 +96,8 @@ FACTORY_WORKER_CONFIG=~/.factory/worker.toml \
   ~/.factory/bin/factory-worker
 ```
 
-See the [local guide](docs/local.md) for a complete setup and the
+See the [Starter Guide](docs/starter-guide.md) for the beginner path, the
+[local guide](docs/local.md) for complete setup and troubleshooting, and the
 [worker guide](docs/worker.md) for runtime and worktree behavior. Use the
 [remote VM guide](docs/remote-workers.md) to enroll a Worker outside the server
 host. Tagged binary

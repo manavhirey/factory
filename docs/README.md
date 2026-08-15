@@ -1,9 +1,12 @@
 # Factory documentation
 
-Start with the root [README](../README.md) to run Factory.
+Start with the [Starter Guide](starter-guide.md) for a guided first run or the
+root [README](../README.md) for the short path.
 
 ## Current implementation
 
+- [Starter Guide](starter-guide.md): build Factory, configure one local Worker,
+  add a repository, and complete the first Routine.
 - [Architecture](../ARCHITECTURE.md): system boundaries, flows, contracts,
   security, limits, and source map.
 - [Local guide](local.md): build, configure, start, delegate, and troubleshoot.
