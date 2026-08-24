@@ -1,6 +1,6 @@
 module github.com/owainlewis/factory
 
-go 1.25.13
+go 1.25.14
 
 require modernc.org/sqlite v1.56.0
 

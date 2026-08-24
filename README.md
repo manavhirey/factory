@@ -46,7 +46,7 @@ first completed Work—follow the [Starter Guide](docs/starter-guide.md).
 
 Requirements:
 
-- Go 1.25.13 or newer on the 1.25 release line, or Go 1.26.5 or newer
+- Go 1.25.14 or newer on the 1.25 release line, or Go 1.26.5 or newer
 - Git
 - `curl`
 - `just`
